@@ -1,0 +1,5 @@
+# This directory stores Qlik Sense SSL certificates
+# Add your certificate files here:
+# - client.pem
+# - client_key.pem
+# - root.pem
