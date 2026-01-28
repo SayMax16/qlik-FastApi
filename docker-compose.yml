@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  qlik-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: qlik-sense-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount certificates directory
+      - ./certs:/app/certs:ro
+      # Mount .env file
+      - ./.env:/app/.env:ro
+    environment:
+      # Override with container-specific settings if needed
+      - HOST=0.0.0.0
+      - PORT=8000
+    restart: unless-stopped
+    networks:
+      - qlik-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  qlik-network:
+    driver: bridge
