@@ -11,7 +11,7 @@ async def list_apps(
 ):
     """List all available applications."""
     apps = await app_service.list_apps()
-    return AppListResponse(apps=apps)
+    return AppListResponse(apps=apps, total=len(apps))
 
 @router.get("/apps/{app_name}/tables", response_model=TableListResponse)
 async def list_tables(

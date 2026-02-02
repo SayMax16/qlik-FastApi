@@ -95,8 +95,15 @@ class AppRepository(BaseRepository):
 
             for app_name, app_id in app_mappings.items():
                 apps.append({
-                    "name": app_name,
-                    "id": app_id
+                    "qDocId": app_id,
+                    "qDocName": app_name,
+                    "qTitle": app_name,
+                    "qThumbnail": None,
+                    "qLastReloadTime": None,
+                    "qModifiedDate": None,
+                    "qFileSize": None,
+                    "published": False,
+                    "stream_name": None
                 })
 
             logger.info(f"Found {len(apps)} apps in configuration")

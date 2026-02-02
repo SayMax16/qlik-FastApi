@@ -18,8 +18,9 @@ router = APIRouter()
 @router.get("/apps/{app_name}", response_model=TableDataResponse)
 async def get_default_table_data(
     app_name: str = Path(..., description="Application name"),
-    page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(100, ge=1, le=1000, description="Items per page"),
+    page: Optional[int] = Query(None, ge=1, description="Page number (omit for all data)"),
+    page_size: int = Query(100, ge=1, le=10000, description="Items per page"),
+    all_data: bool = Query(False, description="Set to true to get all data without pagination"),
     filter_field: Optional[str] = Query(None, description="Field to filter on"),
     filter_value: Optional[str] = Query(None, description="Filter value"),
     sort_field: Optional[str] = Query(None, description="Field to sort by"),
@@ -32,6 +33,11 @@ async def get_default_table_data(
     **Example:**
     ```
     GET /api/v1/apps/afko?page=1&page_size=50
+    ```
+
+    **Get all data (no pagination):**
+    ```
+    GET /api/v1/apps/afko?all_data=true
     ```
 
     **With filtering:**
@@ -51,6 +57,13 @@ async def get_default_table_data(
             status_code=404,
             detail=f"No default table configured for app '{app_name}'"
         )
+
+    # Handle all_data flag - use max allowed page size (10000)
+    if all_data:
+        page = 1
+        page_size = 10000  # Qlik's max allowed page size
+    elif page is None:
+        page = 1  # Default to page 1 if not specified
 
     pagination = PaginationData(page=page, page_size=page_size)
     filters = DataFilterParams(
@@ -74,8 +87,9 @@ async def get_default_table_data(
 async def get_table_data(
     app_name: str = Path(..., description="Application name"),
     table_name: str = Path(..., description="Table name"),
-    page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(100, ge=1, le=1000, description="Items per page"),
+    page: Optional[int] = Query(None, ge=1, description="Page number (omit for all data)"),
+    page_size: int = Query(100, ge=1, le=10000, description="Items per page"),
+    all_data: bool = Query(False, description="Set to true to get all data without pagination"),
     filter_field: Optional[str] = Query(None, description="Field to filter on"),
     filter_value: Optional[str] = Query(None, description="Filter value"),
     sort_field: Optional[str] = Query(None, description="Field to sort by"),
@@ -90,6 +104,11 @@ async def get_table_data(
     GET /api/v1/apps/akfa-employees/tables/Employees?page=1&page_size=50
     ```
 
+    **Get all data (no pagination):**
+    ```
+    GET /api/v1/apps/akfa-employees/tables/Employees?all_data=true
+    ```
+
     **With filtering:**
     ```
     GET /api/v1/apps/akfa-employees/tables/Employees?page=1&page_size=50&filter_field=Department&filter_value=Sales
@@ -100,6 +119,13 @@ async def get_table_data(
     GET /api/v1/apps/akfa-employees/tables/Employees?page=1&sort_field=EmployeeID&sort_order=desc
     ```
     """
+
+    # Handle all_data flag - use max allowed page size (10000)
+    if all_data:
+        page = 1
+        page_size = 10000  # Qlik's max allowed page size
+    elif page is None:
+        page = 1  # Default to page 1 if not specified
 
     pagination = PaginationData(page=page, page_size=page_size)
     filters = DataFilterParams(

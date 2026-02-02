@@ -5,7 +5,7 @@ from typing import List
 
 from src.api.services.base import BaseService
 from src.api.repositories.app_repository import AppRepository
-from src.api.schemas.app import AppInfo, TableInfo
+from src.api.schemas.app import AppMetadata, TableInfo
 from src.api.core.exceptions import AppNotFoundException
 
 
@@ -25,14 +25,14 @@ class AppService(BaseService):
         """
         self.app_repo = app_repository
 
-    async def list_apps(self) -> List[AppInfo]:
+    async def list_apps(self) -> List[AppMetadata]:
         """List all available applications.
 
         Retrieves all configured Qlik Sense applications from the
-        repository and returns them as AppInfo models.
+        repository and returns them as AppMetadata models.
 
         Returns:
-            List of AppInfo models containing app metadata.
+            List of AppMetadata models containing app metadata.
 
         Raises:
             Exception: If there's an error connecting to Qlik Sense.
@@ -41,7 +41,7 @@ class AppService(BaseService):
         apps = await asyncio.to_thread(self.app_repo.list_all_apps)
 
         # Convert raw dictionaries to Pydantic models
-        return [AppInfo(**app) for app in apps]
+        return [AppMetadata(**app) for app in apps]
 
     async def list_tables(self, app_name: str) -> List[TableInfo]:
         """List all tables in an application.
