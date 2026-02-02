@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Path, Query, HTTPException
 from typing import Optional
 from src.api.schemas.data import TableDataResponse, DataFilterParams
 from src.api.services.data_service import DataService
-from src.api.core.dependencies import get_data_service
+from src.api.core.dependencies import get_data_service, verify_api_key
 from src.api.core.config import settings
 
 
@@ -25,7 +25,8 @@ async def get_default_table_data(
     filter_value: Optional[str] = Query(None, description="Filter value"),
     sort_field: Optional[str] = Query(None, description="Field to sort by"),
     sort_order: str = Query("asc", pattern="^(asc|desc)$", description="Sort order"),
-    data_service: DataService = Depends(get_data_service)
+    data_service: DataService = Depends(get_data_service),
+    api_key: str = Depends(verify_api_key)
 ):
     """
     Get paginated data from the default table of a Qlik Sense app.
@@ -94,7 +95,8 @@ async def get_table_data(
     filter_value: Optional[str] = Query(None, description="Filter value"),
     sort_field: Optional[str] = Query(None, description="Field to sort by"),
     sort_order: str = Query("asc", pattern="^(asc|desc)$", description="Sort order"),
-    data_service: DataService = Depends(get_data_service)
+    data_service: DataService = Depends(get_data_service),
+    api_key: str = Depends(verify_api_key)
 ):
     """
     Get paginated data from a specific table in a Qlik Sense app.

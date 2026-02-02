@@ -20,6 +20,7 @@ A modern, high-performance REST API for retrieving data from Qlik Sense applicat
 
 - **FastAPI Framework**: High-performance async Python web framework
 - **Qlik Sense Integration**: Direct access to Qlik Sense Enterprise data
+- **API Key Authentication**: Secure API endpoints with customizable API keys
 - **Pagination Support**: Efficient handling of large datasets
 - **Field Filtering**: Filter data by any field with flexible operators
 - **Sorting**: Multi-field sorting with ascending/descending support
@@ -155,6 +156,9 @@ HOST=0.0.0.0               # Server host (default: 0.0.0.0)
 PORT=8000                  # Server port (default: 8000)
 DEBUG=false                # Debug mode (default: false)
 LOG_LEVEL=INFO             # Logging level (DEBUG, INFO, WARNING, ERROR)
+
+# API Key Authentication
+API_KEY=your-secret-api-key-here  # API key for authentication (REQUIRED)
 
 # CORS Configuration
 CORS_ORIGINS=*             # Allowed origins (* for all, or comma-separated list)
@@ -583,25 +587,59 @@ Target coverage: 80%+ overall, 90%+ for critical paths
 
 ## Examples
 
+**Note**: All API endpoints require authentication using the `X-API-Key` header.
+
+### Authentication
+
+All requests must include the API key in the `X-API-Key` header:
+
+```bash
+curl -H "X-API-Key: your-secret-api-key-here" \
+  http://localhost:8000/api/v1/apps
+```
+
+**Authentication Responses:**
+
+- **401 Unauthorized**: Missing API key
+  ```json
+  {
+    "error": "HTTPException",
+    "message": "Missing API Key. Please provide X-API-Key header.",
+    "status_code": 401
+  }
+  ```
+
+- **403 Forbidden**: Invalid API key
+  ```json
+  {
+    "error": "HTTPException",
+    "message": "Invalid API Key",
+    "status_code": 403
+  }
+  ```
+
 ### Example 1: Get All Employees
 
 ```bash
 curl -X GET "http://localhost:8000/api/v1/apps/akfa-employees/tables/Employees?page=1&page_size=100" \
-  -H "Accept: application/json"
+  -H "Accept: application/json" \
+  -H "X-API-Key: your-secret-api-key-here"
 ```
 
 ### Example 2: Filter Employees by Department
 
 ```bash
 curl -X GET "http://localhost:8000/api/v1/apps/akfa-employees/tables/Employees?page=1&page_size=50&filter_field=Department&filter_value=Engineering" \
-  -H "Accept: application/json"
+  -H "Accept: application/json" \
+  -H "X-API-Key: your-secret-api-key-here"
 ```
 
 ### Example 3: Sort and Paginate Results
 
 ```bash
 curl -X GET "http://localhost:8000/api/v1/apps/akfa-employees/tables/Employees?page=2&page_size=20&sort_field=Salary&sort_direction=desc" \
-  -H "Accept: application/json"
+  -H "Accept: application/json" \
+  -H "X-API-Key: your-secret-api-key-here"
 ```
 
 ### Example 4: Employee Count by Department

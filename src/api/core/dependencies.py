@@ -2,12 +2,17 @@
 
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import Depends, HTTPException, Security, status
+from fastapi.security import APIKeyHeader
 
 from src.api.core.config import Settings, get_settings
 
 from src.api.clients.qlik_engine import QlikEngineClient
 from src.api.clients.qlik_repository import QlikRepositoryClient
+
+
+# API Key security scheme
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 def get_settings_dependency() -> Settings:
@@ -16,6 +21,39 @@ def get_settings_dependency() -> Settings:
 
 
 SettingsDep = Annotated[Settings, Depends(get_settings_dependency)]
+
+
+async def verify_api_key(
+    api_key: str = Security(api_key_header),
+    settings: Settings = Depends(get_settings_dependency)
+) -> str:
+    """
+    Verify the API key from the request header.
+
+    Args:
+        api_key: API key from X-API-Key header
+        settings: Application settings
+
+    Returns:
+        The validated API key
+
+    Raises:
+        HTTPException: If API key is missing or invalid
+    """
+    if api_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API Key. Please provide X-API-Key header.",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    if api_key != settings.API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API Key",
+        )
+
+    return api_key
 
 
 def get_qlik_engine_client(

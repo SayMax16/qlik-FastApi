@@ -28,6 +28,7 @@ class Settings(BaseSettings):
 
     # API Settings
     API_V1_PREFIX: str = Field(default="/api/v1", description="API v1 prefix")
+    API_KEY: str = Field(..., description="API key for authentication")
     ALLOWED_ORIGINS: list[str] = Field(
         default=["http://localhost:3000", "http://localhost:8000"],
         description="CORS allowed origins",
