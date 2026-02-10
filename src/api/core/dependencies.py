@@ -47,7 +47,8 @@ async def verify_api_key(
             headers={"WWW-Authenticate": "ApiKey"},
         )
 
-    if api_key != settings.API_KEY:
+    # Check if key is valid using the new permission system
+    if not settings.validate_api_key(api_key):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API Key",

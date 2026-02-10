@@ -98,3 +98,29 @@ class AppScriptResponse(BaseModel):
     app_id: str = Field(..., description="Application ID")
     script: str = Field(..., description="Load script content")
     sections: list[dict[str, str]] | None = Field(None, description="Script sections")
+
+
+class DimensionDefinition(BaseModel):
+    """Schema for dimension definition."""
+
+    field: str = Field(..., description="Field name or expression")
+    label: str | None = Field(None, description="Dimension label")
+
+
+class MeasureDefinition(BaseModel):
+    """Schema for measure definition."""
+
+    expression: str = Field(..., description="Measure expression")
+    label: str | None = Field(None, description="Measure label")
+    number_format: dict[str, Any] | None = Field(None, description="Number format settings")
+
+
+class ObjectDefinitionResponse(BaseModel):
+    """Response schema for object dimensions and measures."""
+
+    object_id: str = Field(..., description="Object ID")
+    object_type: str = Field(..., description="Object type (e.g., pivot-table, barchart)")
+    app_name: str = Field(..., description="Application name")
+    app_id: str = Field(..., description="Application ID")
+    dimensions: list[DimensionDefinition] = Field(..., description="List of dimensions")
+    measures: list[MeasureDefinition] = Field(..., description="List of measures")

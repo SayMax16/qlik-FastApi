@@ -222,3 +222,212 @@ class AppRepository(BaseRepository):
         except Exception as e:
             logger.error(f"Connection test failed: {str(e)}")
             return False
+
+    def get_object_definition(self, app_id: str, object_id: str) -> Dict:
+        """
+        Get dimensions and measures from a Qlik object (chart, table, etc.).
+
+        Args:
+            app_id: ID of the application
+            object_id: ID of the object
+
+        Returns:
+            Dictionary containing dimensions and measures with their definitions
+        """
+        try:
+            logger.info(f"Fetching object definition for '{object_id}' in app '{app_id}'")
+
+            # Connect to engine
+            self.engine_client.connect()
+
+            try:
+                # Open the app
+                result = self.engine_client.open_doc(app_id, no_data=False)
+                app_handle = result['qReturn']['qHandle']
+
+                # Get the object
+                obj_response = self.engine_client.send_request('GetObject', [object_id], handle=app_handle)
+                obj_handle = obj_response['qReturn']['qHandle']
+
+                # Get object info
+                obj_info_response = self.engine_client.send_request('GetInfo', [], handle=obj_handle)
+                obj_info = obj_info_response.get('qInfo', {})
+                obj_type = obj_info.get('qType', 'unknown')
+
+                # Get properties with full definitions
+                properties = self.engine_client.send_request('GetProperties', [], handle=obj_handle)
+                props = properties.get('qProp', {})
+                hc_def = props.get('qHyperCubeDef', {})
+
+                # Extract dimensions
+                dimensions = []
+                for dim_def in hc_def.get('qDimensions', []):
+                    field_defs = dim_def.get('qDef', {}).get('qFieldDefs', [])
+                    field_labels = dim_def.get('qDef', {}).get('qFieldLabels', [])
+
+                    field = field_defs[0] if field_defs else None
+                    label = field_labels[0] if field_labels else None
+
+                    if field:
+                        dimensions.append({
+                            'field': field,
+                            'label': label if label else field
+                        })
+
+                # Extract measures
+                measures = []
+                for measure_def in hc_def.get('qMeasures', []):
+                    expression = measure_def.get('qDef', {}).get('qDef', '')
+                    label = measure_def.get('qDef', {}).get('qLabel', '')
+                    num_format = measure_def.get('qDef', {}).get('qNumFormat')
+
+                    if expression:
+                        measures.append({
+                            'expression': expression,
+                            'label': label if label else expression,
+                            'number_format': num_format
+                        })
+
+                logger.info(f"Found {len(dimensions)} dimensions and {len(measures)} measures in object '{object_id}'")
+
+                return {
+                    'object_id': object_id,
+                    'object_type': obj_type,
+                    'app_id': app_id,
+                    'dimensions': dimensions,
+                    'measures': measures
+                }
+
+            finally:
+                # Always disconnect
+                self.engine_client.disconnect()
+
+        except Exception as e:
+            logger.error(f"Error fetching object definition for '{object_id}': {str(e)}")
+            raise
+
+    def get_object_data(self, app_id: str, object_id: str, page: int = 1, page_size: int = 100) -> Dict:
+        """
+        Get actual data from a Qlik object with dimensions and measures.
+
+        Args:
+            app_id: ID of the application
+            object_id: ID of the object
+            page: Page number (1-based)
+            page_size: Number of rows per page
+
+        Returns:
+            Dictionary containing data rows with dimension and measure values
+        """
+        try:
+            logger.info(f"Fetching data from object '{object_id}' in app '{app_id}'")
+
+            # Connect to engine
+            self.engine_client.connect()
+
+            try:
+                # Open the app
+                result = self.engine_client.open_doc(app_id, no_data=False)
+                app_handle = result['qReturn']['qHandle']
+
+                # Get the object
+                obj_response = self.engine_client.send_request('GetObject', [object_id], handle=app_handle)
+                obj_handle = obj_response['qReturn']['qHandle']
+
+                # Get properties to extract dimensions and measures
+                properties = self.engine_client.send_request('GetProperties', [], handle=obj_handle)
+                props = properties.get('qProp', {})
+                hc_def = props.get('qHyperCubeDef', {})
+
+                # Extract dimension fields and labels
+                dim_fields = []
+                dim_labels = []
+                for dim_def in hc_def.get('qDimensions', []):
+                    field = dim_def.get('qDef', {}).get('qFieldDefs', [None])[0]
+                    label = dim_def.get('qDef', {}).get('qFieldLabels', [None])[0]
+                    if field:
+                        dim_fields.append(field)
+                        dim_labels.append(label if label else field)
+
+                # Extract measure expressions and labels
+                measure_expressions = []
+                measure_labels = []
+                for measure_def in hc_def.get('qMeasures', []):
+                    expression = measure_def.get('qDef', {}).get('qDef', '')
+                    label = measure_def.get('qDef', {}).get('qLabel', '')
+                    if expression:
+                        measure_expressions.append(expression)
+                        measure_labels.append(label if label else expression)
+
+                logger.info(f"Creating hypercube with {len(dim_fields)} dimensions and {len(measure_expressions)} measures")
+
+                # Create hypercube to get data
+                hypercube_result = self.engine_client.create_hypercube(
+                    app_handle=app_handle,
+                    dimensions=dim_fields,
+                    measures=measure_expressions,
+                    max_rows=page_size
+                )
+
+                if 'error' in hypercube_result:
+                    raise Exception(f"Failed to create hypercube: {hypercube_result['error']}")
+
+                # Extract data from hypercube
+                hypercube_data = hypercube_result.get('hypercube_data', {})
+                data_pages = hypercube_data.get('qDataPages', [])
+
+                data_rows = []
+                if data_pages:
+                    matrix = data_pages[0].get('qMatrix', [])
+
+                    # Calculate offset for pagination
+                    offset = (page - 1) * page_size
+
+                    for row in matrix[offset:offset + page_size]:
+                        row_data = {}
+
+                        # Add dimension values
+                        for i, label in enumerate(dim_labels):
+                            if i < len(row):
+                                cell = row[i]
+                                row_data[label] = cell.get('qText', '')
+
+                        # Add measure values
+                        for i, label in enumerate(measure_labels):
+                            cell_index = len(dim_labels) + i
+                            if cell_index < len(row):
+                                cell = row[cell_index]
+                                # Try to get numeric value first, fallback to text
+                                value = cell.get('qNum', None)
+                                if value is None or str(value).lower() == 'nan':
+                                    value = cell.get('qText', '')
+                                row_data[label] = value
+
+                        data_rows.append(row_data)
+
+                total_rows = hypercube_result.get('total_rows', 0)
+                total_pages = (total_rows + page_size - 1) // page_size
+
+                logger.info(f"Retrieved {len(data_rows)} rows from object '{object_id}'")
+
+                return {
+                    'object_id': object_id,
+                    'app_id': app_id,
+                    'data': data_rows,
+                    'pagination': {
+                        'page': page,
+                        'page_size': page_size,
+                        'total_rows': total_rows,
+                        'total_pages': total_pages,
+                        'has_next': page < total_pages,
+                        'has_previous': page > 1
+                    }
+                }
+
+            finally:
+                # Always disconnect
+                self.engine_client.disconnect()
+
+        except Exception as e:
+            logger.error(f"Error fetching data from object '{object_id}': {str(e)}")
+            raise

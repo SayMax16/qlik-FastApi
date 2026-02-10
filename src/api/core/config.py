@@ -80,6 +80,16 @@ class Settings(BaseSettings):
     # App and Table Mappings
     APP_MAPPINGS_JSON: str = Field(default='{}', description="JSON mapping of app names to IDs")
     DEFAULT_TABLE_MAPPINGS_JSON: str = Field(default='{}', description="JSON mapping of app names to default table IDs")
+    TABLE_OBJECT_MAPPINGS_JSON: str = Field(
+        default='{}',
+        description="JSON mapping of app+table names to Qlik object IDs for dimensions/measures"
+    )
+
+    # API Key Permissions
+    API_KEYS_JSON: str = Field(
+        default='{}',
+        description="JSON mapping of API keys to their permissions"
+    )
 
     @field_validator("ALLOWED_ORIGINS", "CORS_ALLOW_METHODS", "CORS_ALLOW_HEADERS", mode="before")
     @classmethod
@@ -148,6 +158,88 @@ class Settings(BaseSettings):
     def get_default_table_id(self, app_name: str) -> str | None:
         """Get default table ID for an app."""
         return self.default_table_mappings.get(app_name)
+
+    @property
+    def table_object_mappings(self) -> dict[str, str]:
+        """Get table name to object ID mappings."""
+        import json
+        try:
+            return json.loads(self.TABLE_OBJECT_MAPPINGS_JSON)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+
+    def get_object_id_for_table(self, app_name: str, table_name: str) -> str | None:
+        """Get object ID for a table name in a specific app."""
+        key = f"{app_name}.{table_name}"
+        return self.table_object_mappings.get(key)
+
+    @property
+    def api_keys(self) -> dict[str, dict]:
+        """
+        Get API key to permissions mapping.
+
+        Format:
+        {
+            "api-key-1": {
+                "name": "Client A",
+                "allowed_apps": ["app1"],
+                "allowed_tables": {
+                    "app1": ["table1", "table2"]
+                }
+            }
+        }
+        """
+        import json
+        try:
+            keys_dict = json.loads(self.API_KEYS_JSON)
+            if keys_dict:
+                return keys_dict
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Fallback: single API key with full access
+        return {
+            self.API_KEY: {
+                "name": "Admin",
+                "allowed_apps": "*",
+                "allowed_tables": "*"
+            }
+        }
+
+    def validate_api_key(self, api_key: str) -> bool:
+        """Check if API key is valid."""
+        return api_key in self.api_keys
+
+    def get_api_key_permissions(self, api_key: str) -> dict:
+        """Get permissions for an API key."""
+        return self.api_keys.get(api_key, {})
+
+    def can_access_app(self, api_key: str, app_name: str) -> bool:
+        """Check if API key can access an app."""
+        perms = self.get_api_key_permissions(api_key)
+        allowed_apps = perms.get("allowed_apps", [])
+
+        # If "*", allow all
+        if allowed_apps == "*":
+            return True
+
+        return app_name in allowed_apps
+
+    def can_access_table(self, api_key: str, app_name: str, table_name: str) -> bool:
+        """Check if API key can access a specific table."""
+        perms = self.get_api_key_permissions(api_key)
+        allowed_tables = perms.get("allowed_tables", {})
+
+        # If "*", allow all
+        if allowed_tables == "*":
+            return True
+
+        # Check app-specific table permissions
+        app_tables = allowed_tables.get(app_name, [])
+        if app_tables == "*":
+            return True
+
+        return table_name in app_tables
 
 
 @lru_cache
