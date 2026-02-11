@@ -116,7 +116,7 @@ class AppService(BaseService):
 
         return definition
 
-    async def get_object_data(self, app_name: str, object_id: str, page: int = 1, page_size: int = 100) -> Dict:
+    async def get_object_data(self, app_name: str, object_id: str, page: int = 1, page_size: int = 100, filters: Dict = None) -> Dict:
         """Get actual data from an object.
 
         Retrieves data rows with dimension and measure values from
@@ -127,6 +127,7 @@ class AppService(BaseService):
             object_id: ID of the object to retrieve data from.
             page: Page number (1-based).
             page_size: Number of rows per page.
+            filters: Optional dictionary of field filters (field_name: value).
 
         Returns:
             Dictionary containing data rows with pagination info.
@@ -146,7 +147,8 @@ class AppService(BaseService):
             app_id,
             object_id,
             page,
-            page_size
+            page_size,
+            filters or {}
         )
 
         # Add app_name to the result

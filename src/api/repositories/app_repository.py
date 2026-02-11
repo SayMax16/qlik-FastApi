@@ -306,7 +306,7 @@ class AppRepository(BaseRepository):
             logger.error(f"Error fetching object definition for '{object_id}': {str(e)}")
             raise
 
-    def get_object_data(self, app_id: str, object_id: str, page: int = 1, page_size: int = 100) -> Dict:
+    def get_object_data(self, app_id: str, object_id: str, page: int = 1, page_size: int = 100, filters: Dict = None) -> Dict:
         """
         Get actual data from a Qlik object with dimensions and measures.
 
@@ -315,12 +315,15 @@ class AppRepository(BaseRepository):
             object_id: ID of the object
             page: Page number (1-based)
             page_size: Number of rows per page
+            filters: Optional dictionary of field filters (field_name: value)
 
         Returns:
             Dictionary containing data rows with dimension and measure values
         """
         try:
             logger.info(f"Fetching data from object '{object_id}' in app '{app_id}'")
+            if filters:
+                logger.info(f"Will apply client-side filters: {filters}")
 
             # Connect to engine
             self.engine_client.connect()
@@ -362,11 +365,13 @@ class AppRepository(BaseRepository):
                 logger.info(f"Creating hypercube with {len(dim_fields)} dimensions and {len(measure_expressions)} measures")
 
                 # Create hypercube to get data
+                # Fetch more rows if filters are applied to allow client-side filtering
+                fetch_rows = 1000 if filters else page_size
                 hypercube_result = self.engine_client.create_hypercube(
                     app_handle=app_handle,
                     dimensions=dim_fields,
                     measures=measure_expressions,
-                    max_rows=page_size
+                    max_rows=fetch_rows
                 )
 
                 if 'error' in hypercube_result:
@@ -376,14 +381,11 @@ class AppRepository(BaseRepository):
                 hypercube_data = hypercube_result.get('hypercube_data', {})
                 data_pages = hypercube_data.get('qDataPages', [])
 
-                data_rows = []
+                all_rows = []
                 if data_pages:
                     matrix = data_pages[0].get('qMatrix', [])
 
-                    # Calculate offset for pagination
-                    offset = (page - 1) * page_size
-
-                    for row in matrix[offset:offset + page_size]:
+                    for row in matrix:
                         row_data = {}
 
                         # Add dimension values
@@ -403,12 +405,31 @@ class AppRepository(BaseRepository):
                                     value = cell.get('qText', '')
                                 row_data[label] = value
 
-                        data_rows.append(row_data)
+                        all_rows.append(row_data)
 
-                total_rows = hypercube_result.get('total_rows', 0)
-                total_pages = (total_rows + page_size - 1) // page_size
+                # Apply client-side filters if provided
+                filtered_rows = all_rows
+                if filters:
+                    # Map field names to their display labels
+                    field_to_label = dict(zip(dim_fields, dim_labels))
 
-                logger.info(f"Retrieved {len(data_rows)} rows from object '{object_id}'")
+                    for field_name, field_value in filters.items():
+                        # Get the label that corresponds to this field
+                        filter_label = field_to_label.get(field_name, field_name)
+
+                        logger.info(f"Filtering by {filter_label} (field: {field_name}) = {field_value}")
+                        filtered_rows = [
+                            row for row in filtered_rows
+                            if str(row.get(filter_label, '')).strip() == str(field_value).strip()
+                        ]
+
+                # Apply pagination to filtered results
+                total_rows = len(filtered_rows)
+                total_pages = (total_rows + page_size - 1) // page_size if total_rows > 0 else 1
+                offset = (page - 1) * page_size
+                data_rows = filtered_rows[offset:offset + page_size]
+
+                logger.info(f"Retrieved {len(data_rows)} rows from object '{object_id}' (page {page}/{total_pages}, total {total_rows} rows)")
 
                 return {
                     'object_id': object_id,
