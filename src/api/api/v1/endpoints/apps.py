@@ -1,10 +1,121 @@
 from fastapi import APIRouter, Depends, Path, HTTPException, Query
-from typing import Optional
+from typing import Optional, List
 from src.api.services.app_service import AppService
 from src.api.core.dependencies import get_app_service, verify_api_key
 from src.api.core.config import settings
 
 router = APIRouter()
+
+# IMPORTANT: More specific routes must come BEFORE generic routes
+# This application_status route must be defined before the generic {table_name} route
+
+@router.get("/apps/{app_name}/tables/application_status/data")
+async def get_application_status_data(
+    app_name: str = Path(..., description="Application name"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(100, ge=1, le=10000, description="Rows per page"),
+    yearmonth: Optional[str] = Query(None, description="Filter by YearMonth (format: 2026.01 or 2026-01), supports multiple values separated by comma"),
+    app_service: AppService = Depends(get_app_service),
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Get application status data with optional YearMonth filtering.
+
+    This endpoint retrieves data from the application_status table and supports
+    filtering by YearMonth field using Qlik selections. The YearMonth field
+    exists in the app but may not be in the table itself.
+
+    **Examples:**
+
+    Get all data (no filtering):
+    ```
+    GET /api/v1/apps/Stock/tables/application_status/data?page=1&page_size=100
+    ```
+
+    Filter by single month:
+    ```
+    GET /api/v1/apps/Stock/tables/application_status/data?page=1&page_size=100&yearmonth=2024-01
+    ```
+
+    Filter by multiple months:
+    ```
+    GET /api/v1/apps/Stock/tables/application_status/data?page=1&page_size=100&yearmonth=2024-01,2024-02,2024-03
+    ```
+
+    **Response format:**
+    ```json
+    {
+      "object_id": "UWDJj",
+      "app_id": "...",
+      "app_name": "Stock",
+      "data": [
+        {
+          "Field1": "Value1",
+          "Field2": "Value2",
+          ...
+        }
+      ],
+      "pagination": {
+        "page": 1,
+        "page_size": 100,
+        "total_rows": 150,
+        "total_pages": 2,
+        "has_next": true,
+        "has_previous": false
+      }
+    }
+    ```
+    """
+    table_name = "application_status"
+
+    # Check app access
+    if not settings.can_access_app(api_key, app_name):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your API key does not have access to app '{app_name}'"
+        )
+
+    # Check table access
+    if not settings.can_access_table(api_key, app_name, table_name):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your API key does not have access to table '{table_name}' in app '{app_name}'"
+        )
+
+    # Get object ID for this table
+    object_id = settings.get_object_id_for_table(app_name, table_name)
+    if not object_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No object mapping found for table '{table_name}' in app '{app_name}'"
+        )
+
+    # Build selections dictionary for Qlik
+    selections = {}
+    if yearmonth:
+        # Parse comma-separated values and normalize format.
+        # The Qlik field stores values as "YYYY.MM" (e.g. "2026.01").
+        # Accept both "2026-01" (hyphen) and "2026.01" (dot) from the caller.
+        yearmonth_values = [ym.strip().replace('-', '.') for ym in yearmonth.split(',')]
+        selections['YearMonth'] = yearmonth_values
+
+    # Look up the default bookmark for this table (if configured)
+    # The bookmark filters the pivot to a manageable date range so all 12 dimensions are visible.
+    bookmark_id = settings.get_bookmark_id(app_name, table_name)
+
+    # Use pivot data method (GetHyperCubePivotData) - reads the pre-computed pivot table
+    # which is dramatically faster than creating a session hypercube
+    data = await app_service.get_pivot_object_data(
+        app_name=app_name,
+        object_id=object_id,
+        page=page,
+        page_size=page_size,
+        selections=selections,  # Qlik selections applied after the bookmark
+        bookmark_id=bookmark_id  # Applied first to establish filtered state
+    )
+
+    return data
+
 
 @router.get("/apps/{app_name}/tables/{table_name}/data")
 async def get_table_data_with_measures(

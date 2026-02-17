@@ -250,12 +250,12 @@ class AppRepository(BaseRepository):
                 obj_handle = obj_response['qReturn']['qHandle']
 
                 # Get object info
-                obj_info_response = self.engine_client.send_request('GetInfo', [], handle=obj_handle)
+                obj_info_response = self.engine_client.send_request('GetInfo', handle=obj_handle)
                 obj_info = obj_info_response.get('qInfo', {})
                 obj_type = obj_info.get('qType', 'unknown')
 
                 # Get properties with full definitions
-                properties = self.engine_client.send_request('GetProperties', [], handle=obj_handle)
+                properties = self.engine_client.send_request('GetProperties', handle=obj_handle)
                 props = properties.get('qProp', {})
                 hc_def = props.get('qHyperCubeDef', {})
 
@@ -306,7 +306,62 @@ class AppRepository(BaseRepository):
             logger.error(f"Error fetching object definition for '{object_id}': {str(e)}")
             raise
 
-    def get_object_data(self, app_id: str, object_id: str, page: int = 1, page_size: int = 100, filters: Dict = None) -> Dict:
+    def get_pivot_object_data(self, app_id: str, object_id: str, page: int = 1, page_size: int = 100, selections: Dict = None, bookmark_id: str = None) -> Dict:
+        """
+        Get data from a pivot-table object using GetHyperCubePivotData.
+
+        This is much faster than creating a session hypercube for pivot objects
+        because it reads from the already-computed Qlik pivot table.
+
+        When a bookmark_id is supplied, it is applied to the app session before
+        fetching data so the pivot reflects the bookmarked filter state. This is
+        critical for tables with many dimensions where an unfiltered pivot would
+        be too large to compute.
+
+        Args:
+            app_id: ID of the application
+            object_id: ID of the pivot table object
+            page: Page number (1-based)
+            page_size: Number of rows per page
+            selections: Optional dict of field selections
+            bookmark_id: Optional bookmark ID to apply before fetching
+
+        Returns:
+            Dictionary containing data rows with pagination
+        """
+        try:
+            logger.info(f"Fetching pivot data from object '{object_id}' in app '{app_id}'")
+            if bookmark_id:
+                logger.info(f"Will apply bookmark '{bookmark_id}' before fetching")
+
+            self.engine_client.connect()
+
+            try:
+                result = self.engine_client.open_doc(app_id, no_data=False)
+                app_handle = result['qReturn']['qHandle']
+
+                pivot_data = self.engine_client.get_pivot_data(
+                    app_handle=app_handle,
+                    object_id=object_id,
+                    page=page,
+                    page_size=page_size,
+                    selections=selections or {},
+                    bookmark_id=bookmark_id
+                )
+
+                if 'error' in pivot_data:
+                    raise Exception(f"Pivot data error: {pivot_data['error']}")
+
+                return pivot_data
+
+            finally:
+                self.engine_client.disconnect()
+
+        except Exception as e:
+            logger.error(f"Error fetching pivot data from '{object_id}': {str(e)}")
+            raise
+
+    def get_object_data(self, app_id: str, object_id: str, page: int = 1, page_size: int = 100, filters: Dict = None, selections: Dict = None) -> Dict:
         """
         Get actual data from a Qlik object with dimensions and measures.
 
@@ -315,7 +370,8 @@ class AppRepository(BaseRepository):
             object_id: ID of the object
             page: Page number (1-based)
             page_size: Number of rows per page
-            filters: Optional dictionary of field filters (field_name: value)
+            filters: Optional dictionary of field filters for client-side filtering (field_name: value)
+            selections: Optional dictionary of field selections to apply in Qlik before retrieving data (field_name: [values])
 
         Returns:
             Dictionary containing data rows with dimension and measure values
@@ -324,6 +380,8 @@ class AppRepository(BaseRepository):
             logger.info(f"Fetching data from object '{object_id}' in app '{app_id}'")
             if filters:
                 logger.info(f"Will apply client-side filters: {filters}")
+            if selections:
+                logger.info(f"Will apply Qlik selections: {selections}")
 
             # Connect to engine
             self.engine_client.connect()
@@ -333,12 +391,25 @@ class AppRepository(BaseRepository):
                 result = self.engine_client.open_doc(app_id, no_data=False)
                 app_handle = result['qReturn']['qHandle']
 
+                # Apply Qlik selections if provided
+                if selections:
+                    for field_name, field_values in selections.items():
+                        # Ensure field_values is a list
+                        if not isinstance(field_values, list):
+                            field_values = [field_values]
+
+                        logger.info(f"Applying selection on field '{field_name}' with values: {field_values}")
+                        try:
+                            self.engine_client.select_values(app_handle, field_name, field_values)
+                        except Exception as sel_error:
+                            logger.warning(f"Failed to apply selection on '{field_name}': {str(sel_error)}")
+
                 # Get the object
                 obj_response = self.engine_client.send_request('GetObject', [object_id], handle=app_handle)
                 obj_handle = obj_response['qReturn']['qHandle']
 
                 # Get properties to extract dimensions and measures
-                properties = self.engine_client.send_request('GetProperties', [], handle=obj_handle)
+                properties = self.engine_client.send_request('GetProperties', handle=obj_handle)
                 props = properties.get('qProp', {})
                 hc_def = props.get('qHyperCubeDef', {})
 
@@ -362,9 +433,11 @@ class AppRepository(BaseRepository):
                         measure_expressions.append(expression)
                         measure_labels.append(label if label else expression)
 
+                logger.info(f"Object has {len(dim_fields)} dimensions and {len(measure_expressions)} measures")
+
+                # Create hypercube to get data - same method for all objects
                 logger.info(f"Creating hypercube with {len(dim_fields)} dimensions and {len(measure_expressions)} measures")
 
-                # Create hypercube to get data
                 # Fetch more rows if filters are applied to allow client-side filtering
                 fetch_rows = 1000 if filters else page_size
                 hypercube_result = self.engine_client.create_hypercube(
@@ -446,6 +519,14 @@ class AppRepository(BaseRepository):
                 }
 
             finally:
+                # Clear selections if they were applied
+                if selections:
+                    try:
+                        logger.info("Clearing selections before disconnect")
+                        self.engine_client.clear_all(app_handle)
+                    except Exception as clear_error:
+                        logger.warning(f"Failed to clear selections: {str(clear_error)}")
+
                 # Always disconnect
                 self.engine_client.disconnect()
 
