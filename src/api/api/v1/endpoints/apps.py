@@ -90,28 +90,20 @@ async def get_application_status_data(
             detail=f"No object mapping found for table '{table_name}' in app '{app_name}'"
         )
 
-    # Build selections dictionary for Qlik
-    selections = {}
-    if yearmonth:
-        # Parse comma-separated values and normalize format.
-        # The Qlik field stores values as "YYYY.MM" (e.g. "2026.01").
-        # Accept both "2026-01" (hyphen) and "2026.01" (dot) from the caller.
-        yearmonth_values = [ym.strip().replace('-', '.') for ym in yearmonth.split(',')]
-        selections['YearMonth'] = yearmonth_values
-
-    # Look up the default bookmark for this table (if configured)
-    # The bookmark filters the pivot to a manageable date range so all 12 dimensions are visible.
+    # Get bookmark ID for this table
+    # The bookmark pre-filters the data to 3 months for fast retrieval
     bookmark_id = settings.get_bookmark_id(app_name, table_name)
 
-    # Use pivot data method (GetHyperCubePivotData) - reads the pre-computed pivot table
-    # which is dramatically faster than creating a session hypercube
-    data = await app_service.get_pivot_object_data(
+    # application_status uses the regular table object (UWDJj)
+    # Apply bookmark FIRST to filter the data before creating the hypercube
+    data = await app_service.get_object_data(
         app_name=app_name,
         object_id=object_id,
         page=page,
         page_size=page_size,
-        selections=selections,  # Qlik selections applied after the bookmark
-        bookmark_id=bookmark_id  # Applied first to establish filtered state
+        filters={},  # No client-side filtering
+        selections={},  # No Qlik selections - rely on bookmark
+        bookmark_id=bookmark_id  # Applied FIRST to filter the data
     )
 
     return data

@@ -361,7 +361,7 @@ class AppRepository(BaseRepository):
             logger.error(f"Error fetching pivot data from '{object_id}': {str(e)}")
             raise
 
-    def get_object_data(self, app_id: str, object_id: str, page: int = 1, page_size: int = 100, filters: Dict = None, selections: Dict = None) -> Dict:
+    def get_object_data(self, app_id: str, object_id: str, page: int = 1, page_size: int = 100, filters: Dict = None, selections: Dict = None, bookmark_id: str = None) -> Dict:
         """
         Get actual data from a Qlik object with dimensions and measures.
 
@@ -372,12 +372,15 @@ class AppRepository(BaseRepository):
             page_size: Number of rows per page
             filters: Optional dictionary of field filters for client-side filtering (field_name: value)
             selections: Optional dictionary of field selections to apply in Qlik before retrieving data (field_name: [values])
+            bookmark_id: Optional bookmark ID to apply before fetching data
 
         Returns:
             Dictionary containing data rows with dimension and measure values
         """
         try:
             logger.info(f"Fetching data from object '{object_id}' in app '{app_id}'")
+            if bookmark_id:
+                logger.info(f"Will apply bookmark '{bookmark_id}' before fetching")
             if filters:
                 logger.info(f"Will apply client-side filters: {filters}")
             if selections:
@@ -390,6 +393,10 @@ class AppRepository(BaseRepository):
                 # Open the app
                 result = self.engine_client.open_doc(app_id, no_data=False)
                 app_handle = result['qReturn']['qHandle']
+
+                # Apply bookmark first if provided
+                if bookmark_id:
+                    self.engine_client.apply_bookmark(app_handle, bookmark_id)
 
                 # Apply Qlik selections if provided
                 if selections:
@@ -435,24 +442,31 @@ class AppRepository(BaseRepository):
 
                 logger.info(f"Object has {len(dim_fields)} dimensions and {len(measure_expressions)} measures")
 
-                # Create hypercube to get data - same method for all objects
-                logger.info(f"Creating hypercube with {len(dim_fields)} dimensions and {len(measure_expressions)} measures")
+                # Get layout to determine total rows in the object's hypercube
+                layout = self.engine_client.send_request('GetLayout', [], handle=obj_handle)
+                hc_layout = layout.get('qLayout', {}).get('qHyperCube', {})
+                total_rows = hc_layout.get('qSize', {}).get('qcy', 0)
 
-                # Fetch more rows if filters are applied to allow client-side filtering
+                logger.info(f"Object hypercube has {total_rows} total rows after bookmark/selections")
+
+                # Fetch data directly from the object's hypercube using GetHyperCubeData
+                # Calculate how many rows to fetch
                 fetch_rows = 1000 if filters else page_size
-                hypercube_result = self.engine_client.create_hypercube(
-                    app_handle=app_handle,
-                    dimensions=dim_fields,
-                    measures=measure_expressions,
-                    max_rows=fetch_rows
-                )
+                start_row = 0 if filters else (page - 1) * page_size
 
-                if 'error' in hypercube_result:
-                    raise Exception(f"Failed to create hypercube: {hypercube_result['error']}")
+                # Ensure we don't fetch more than available
+                fetch_rows = min(fetch_rows, total_rows - start_row) if start_row < total_rows else 0
 
-                # Extract data from hypercube
-                hypercube_data = hypercube_result.get('hypercube_data', {})
-                data_pages = hypercube_data.get('qDataPages', [])
+                data_pages = []
+                if fetch_rows > 0:
+                    logger.info(f"Fetching {fetch_rows} rows starting from row {start_row}")
+
+                    data_request = self.engine_client.send_request(
+                        'GetHyperCubeData',
+                        ['/qHyperCubeDef', [{'qTop': start_row, 'qLeft': 0, 'qWidth': len(dim_fields) + len(measure_expressions), 'qHeight': fetch_rows}]],
+                        handle=obj_handle
+                    )
+                    data_pages = data_request.get('qDataPages', [])
 
                 all_rows = []
                 if data_pages:
@@ -497,12 +511,19 @@ class AppRepository(BaseRepository):
                         ]
 
                 # Apply pagination to filtered results
-                total_rows = len(filtered_rows)
-                total_pages = (total_rows + page_size - 1) // page_size if total_rows > 0 else 1
-                offset = (page - 1) * page_size
-                data_rows = filtered_rows[offset:offset + page_size]
+                # If filters were applied, total_rows is the filtered count; otherwise use the object's total
+                pagination_total = len(filtered_rows) if filters else total_rows
+                total_pages = (pagination_total + page_size - 1) // page_size if pagination_total > 0 else 1
 
-                logger.info(f"Retrieved {len(data_rows)} rows from object '{object_id}' (page {page}/{total_pages}, total {total_rows} rows)")
+                # For filtered data, we already have all rows in memory, so paginate from that
+                # For non-filtered data, we already fetched only the requested page
+                if filters:
+                    offset = (page - 1) * page_size
+                    data_rows = filtered_rows[offset:offset + page_size]
+                else:
+                    data_rows = filtered_rows  # This is already the correct page
+
+                logger.info(f"Retrieved {len(data_rows)} rows from object '{object_id}' (page {page}/{total_pages}, total {pagination_total} rows)")
 
                 return {
                     'object_id': object_id,
@@ -511,7 +532,7 @@ class AppRepository(BaseRepository):
                     'pagination': {
                         'page': page,
                         'page_size': page_size,
-                        'total_rows': total_rows,
+                        'total_rows': pagination_total,
                         'total_pages': total_pages,
                         'has_next': page < total_pages,
                         'has_previous': page > 1
