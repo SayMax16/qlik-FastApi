@@ -451,7 +451,13 @@ class AppRepository(BaseRepository):
 
                 # Fetch data directly from the object's hypercube using GetHyperCubeData
                 # Calculate how many rows to fetch
+                # Qlik has a limit on cells per request (~10,000 cells typically)
+                # With 15 columns (12 dims + 3 measures), max safe rows is ~500-600
+                num_columns = len(dim_fields) + len(measure_expressions)
+                max_safe_rows = min(500, 10000 // max(num_columns, 1))  # Conservative limit
+
                 fetch_rows = 1000 if filters else page_size
+                fetch_rows = min(fetch_rows, max_safe_rows)  # Cap at safe limit
                 start_row = 0 if filters else (page - 1) * page_size
 
                 # Ensure we don't fetch more than available
@@ -459,14 +465,31 @@ class AppRepository(BaseRepository):
 
                 data_pages = []
                 if fetch_rows > 0:
-                    logger.info(f"Fetching {fetch_rows} rows starting from row {start_row}")
+                    logger.info(f"Fetching {fetch_rows} rows starting from row {start_row} ({num_columns} columns)")
 
-                    data_request = self.engine_client.send_request(
-                        'GetHyperCubeData',
-                        ['/qHyperCubeDef', [{'qTop': start_row, 'qLeft': 0, 'qWidth': len(dim_fields) + len(measure_expressions), 'qHeight': fetch_rows}]],
-                        handle=obj_handle
-                    )
-                    data_pages = data_request.get('qDataPages', [])
+                    try:
+                        data_request = self.engine_client.send_request(
+                            'GetHyperCubeData',
+                            ['/qHyperCubeDef', [{'qTop': start_row, 'qLeft': 0, 'qWidth': num_columns, 'qHeight': fetch_rows}]],
+                            handle=obj_handle
+                        )
+                        data_pages = data_request.get('qDataPages', [])
+                    except Exception as e:
+                        if 'too large' in str(e).lower():
+                            logger.warning(f"Result too large error, reducing fetch size from {fetch_rows} to {fetch_rows // 2}")
+                            # Retry with half the rows
+                            fetch_rows = fetch_rows // 2
+                            if fetch_rows > 0:
+                                data_request = self.engine_client.send_request(
+                                    'GetHyperCubeData',
+                                    ['/qHyperCubeDef', [{'qTop': start_row, 'qLeft': 0, 'qWidth': num_columns, 'qHeight': fetch_rows}]],
+                                    handle=obj_handle
+                                )
+                                data_pages = data_request.get('qDataPages', [])
+                            else:
+                                raise
+                        else:
+                            raise
 
                 all_rows = []
                 if data_pages:
@@ -513,7 +536,10 @@ class AppRepository(BaseRepository):
                 # Apply pagination to filtered results
                 # If filters were applied, total_rows is the filtered count; otherwise use the object's total
                 pagination_total = len(filtered_rows) if filters else total_rows
-                total_pages = (pagination_total + page_size - 1) // page_size if pagination_total > 0 else 1
+
+                # Use actual fetched rows (might be less than requested page_size due to Qlik limits)
+                actual_page_size = len(filtered_rows) if not filters else page_size
+                total_pages = (pagination_total + actual_page_size - 1) // actual_page_size if pagination_total > 0 else 1
 
                 # For filtered data, we already have all rows in memory, so paginate from that
                 # For non-filtered data, we already fetched only the requested page
@@ -531,7 +557,7 @@ class AppRepository(BaseRepository):
                     'data': data_rows,
                     'pagination': {
                         'page': page,
-                        'page_size': page_size,
+                        'page_size': actual_page_size,  # Return actual size, not requested
                         'total_rows': pagination_total,
                         'total_pages': total_pages,
                         'has_next': page < total_pages,
