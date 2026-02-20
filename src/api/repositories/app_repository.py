@@ -415,37 +415,52 @@ class AppRepository(BaseRepository):
                 obj_response = self.engine_client.send_request('GetObject', [object_id], handle=app_handle)
                 obj_handle = obj_response['qReturn']['qHandle']
 
-                # Get properties to extract dimensions and measures
-                properties = self.engine_client.send_request('GetProperties', handle=obj_handle)
-                props = properties.get('qProp', {})
-                hc_def = props.get('qHyperCubeDef', {})
-
-                # Extract dimension fields and labels
-                dim_fields = []
-                dim_labels = []
-                for dim_def in hc_def.get('qDimensions', []):
-                    field = dim_def.get('qDef', {}).get('qFieldDefs', [None])[0]
-                    label = dim_def.get('qDef', {}).get('qFieldLabels', [None])[0]
-                    if field:
-                        dim_fields.append(field)
-                        dim_labels.append(label if label else field)
-
-                # Extract measure expressions and labels
-                measure_expressions = []
-                measure_labels = []
-                for measure_def in hc_def.get('qMeasures', []):
-                    expression = measure_def.get('qDef', {}).get('qDef', '')
-                    label = measure_def.get('qDef', {}).get('qLabel', '')
-                    if expression:
-                        measure_expressions.append(expression)
-                        measure_labels.append(label if label else expression)
-
-                logger.info(f"Object has {len(dim_fields)} dimensions and {len(measure_expressions)} measures")
-
-                # Get layout to determine total rows in the object's hypercube
+                # Get layout first to get correct dimension/measure info and row count
                 layout = self.engine_client.send_request('GetLayout', [], handle=obj_handle)
                 hc_layout = layout.get('qLayout', {}).get('qHyperCube', {})
                 total_rows = hc_layout.get('qSize', {}).get('qcy', 0)
+
+                # Extract dimension fields and labels from layout (most reliable source)
+                dim_fields = []
+                dim_labels = []
+                for dim_info in hc_layout.get('qDimensionInfo', []):
+                    # Use qFallbackTitle which contains the correct label
+                    label = dim_info.get('qFallbackTitle', '')
+                    # Get field name from qGroupFieldDefs
+                    group_defs = dim_info.get('qGroupFieldDefs', [])
+                    field = group_defs[0] if group_defs else label
+
+                    dim_fields.append(field)
+                    dim_labels.append(label)
+
+                # Extract measure labels from layout
+                measure_labels = []
+                for meas_info in hc_layout.get('qMeasureInfo', []):
+                    label = meas_info.get('qFallbackTitle', '')
+                    measure_labels.append(label)
+
+                # We still need to get properties for measure expressions (for field mapping)
+                # and to get the visual column order
+                properties = self.engine_client.send_request('GetFullPropertyTree', handle=obj_handle)
+                # The full property tree has the structure qPropEntry.qProperty.qHyperCubeDef
+                prop_entry = properties.get('qPropEntry', {})
+                prop_property = prop_entry.get('qProperty', {})
+                hc_def = prop_property.get('qHyperCubeDef', {})
+
+                measure_expressions = []
+                for measure_def in hc_def.get('qMeasures', []):
+                    expression = measure_def.get('qDef', {}).get('qDef', '')
+                    if expression:
+                        measure_expressions.append(expression)
+
+                # Get the visual column order (how columns are displayed in the UI)
+                column_order = hc_def.get('qColumnOrder', [])
+                if not column_order:
+                    # Fallback to natural order if no column order is specified
+                    column_order = list(range(len(dim_fields) + len(measure_expressions)))
+
+                logger.info(f"Object has {len(dim_fields)} dimensions and {len(measure_expressions)} measures")
+                logger.info(f"Visual column order: {column_order}")
 
                 logger.info(f"Object hypercube has {total_rows} total rows after bookmark/selections")
 
@@ -495,25 +510,41 @@ class AppRepository(BaseRepository):
                 if data_pages:
                     matrix = data_pages[0].get('qMatrix', [])
 
+                    # Create combined list of all labels (dims + measures) in hypercube order
+                    all_labels = dim_labels + measure_labels
+
+                    # IMPORTANT: qMatrix returns data cells in VISUAL column order, not hypercube order!
+                    # We need to create a reverse mapping: hypercube_column -> cell_index
+                    hypercube_to_cell = {}
+                    for cell_index, hypercube_column in enumerate(column_order):
+                        hypercube_to_cell[hypercube_column] = cell_index
+
                     for row in matrix:
                         row_data = {}
 
-                        # Add dimension values
-                        for i, label in enumerate(dim_labels):
-                            if i < len(row):
-                                cell = row[i]
-                                row_data[label] = cell.get('qText', '')
+                        # Iterate through all labels in their hypercube order
+                        # and map each to its corresponding cell based on column_order
+                        for hypercube_column in range(len(all_labels)):
+                            if hypercube_column not in hypercube_to_cell:
+                                continue
 
-                        # Add measure values
-                        for i, label in enumerate(measure_labels):
-                            cell_index = len(dim_labels) + i
-                            if cell_index < len(row):
-                                cell = row[cell_index]
-                                # Try to get numeric value first, fallback to text
+                            cell_index = hypercube_to_cell[hypercube_column]
+                            if cell_index >= len(row):
+                                continue
+
+                            label = all_labels[hypercube_column]
+                            cell = row[cell_index]
+
+                            # For dimensions (indices 0 to len(dim_labels)-1), use text
+                            # For measures (indices >= len(dim_labels)), prefer numeric value
+                            if hypercube_column < len(dim_labels):
+                                value = cell.get('qText', '')
+                            else:
                                 value = cell.get('qNum', None)
                                 if value is None or str(value).lower() == 'nan':
                                     value = cell.get('qText', '')
-                                row_data[label] = value
+
+                            row_data[label] = value
 
                         all_rows.append(row_data)
 
