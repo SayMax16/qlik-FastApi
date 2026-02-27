@@ -350,15 +350,19 @@ class AppRepository(BaseRepository):
                 )
 
                 if 'error' in pivot_data:
+                    logger.error(f"Pivot data error details: {pivot_data}")
                     raise Exception(f"Pivot data error: {pivot_data['error']}")
 
                 return pivot_data
 
             finally:
-                self.engine_client.disconnect()
+                try:
+                    self.engine_client.disconnect()
+                except Exception as disc_err:
+                    logger.warning(f"Error during disconnect: {disc_err}")
 
         except Exception as e:
-            logger.error(f"Error fetching pivot data from '{object_id}': {str(e)}")
+            logger.error(f"Error fetching pivot data from '{object_id}': {str(e)}", exc_info=True)
             raise
 
     def get_object_data(self, app_id: str, object_id: str, page: int = 1, page_size: int = 100, filters: Dict = None, selections: Dict = None, bookmark_id: str = None) -> Dict:
@@ -418,183 +422,478 @@ class AppRepository(BaseRepository):
                 # Get layout first to get correct dimension/measure info and row count
                 layout = self.engine_client.send_request('GetLayout', [], handle=obj_handle)
                 hc_layout = layout.get('qLayout', {}).get('qHyperCube', {})
-                total_rows = hc_layout.get('qSize', {}).get('qcy', 0)
+                qsize = hc_layout.get('qSize', {})
+                total_rows = qsize.get('qcy', 0)
+                visible_cols = qsize.get('qcx', 0)
 
-                # Extract dimension fields and labels from layout (most reliable source)
-                dim_fields = []
-                dim_labels = []
-                for dim_info in hc_layout.get('qDimensionInfo', []):
-                    # Use qFallbackTitle which contains the correct label
-                    label = dim_info.get('qFallbackTitle', '')
-                    # Get field name from qGroupFieldDefs
-                    group_defs = dim_info.get('qGroupFieldDefs', [])
-                    field = group_defs[0] if group_defs else label
+                logger.info(f"Hypercube size from layout: {qsize}")
+                logger.info(f"Total rows reported: {total_rows}")
+                dim_count = len(hc_layout.get('qDimensionInfo', []))
+                meas_count = len(hc_layout.get('qMeasureInfo', []))
+                logger.info(f"Dimension count: {dim_count}")
+                logger.info(f"Measure count: {meas_count}")
 
-                    dim_fields.append(field)
-                    dim_labels.append(label)
+                # Detect pivot tables that need expansion:
+                # 1. If total rows is 0 but dimensions exist (calc condition unfulfilled)
+                # 2. If visible columns (qcx) is less than dimensions (pivot is collapsed)
+                # In both cases, use GetHyperCubePivotData which returns expanded data
+                is_collapsed_pivot = visible_cols < dim_count and dim_count > 0
+                is_empty_pivot = total_rows == 0 and dim_count > 0
+                logger.info(f"Pivot detection: visible_cols={visible_cols}, dim_count={dim_count}, is_collapsed_pivot={is_collapsed_pivot}, is_empty_pivot={is_empty_pivot}")
 
-                # Extract measure labels from layout
-                measure_labels = []
-                for meas_info in hc_layout.get('qMeasureInfo', []):
-                    label = meas_info.get('qFallbackTitle', '')
-                    measure_labels.append(label)
+                use_regular_hypercube = False  # Flag to control flow
 
-                # We still need to get properties for measure expressions (for field mapping)
-                # and to get the visual column order
-                properties = self.engine_client.send_request('GetFullPropertyTree', handle=obj_handle)
-                # The full property tree has the structure qPropEntry.qProperty.qHyperCubeDef
-                prop_entry = properties.get('qPropEntry', {})
-                prop_property = prop_entry.get('qProperty', {})
-                hc_def = prop_property.get('qHyperCubeDef', {})
+                if is_collapsed_pivot or is_empty_pivot:
+                    if is_collapsed_pivot:
+                        logger.info(f"Pivot table has {dim_count} dimensions but only {visible_cols} visible columns - will try to get expanded data")
+                    else:
+                        logger.info("Hypercube has 0 rows but has dimensions - trying GetHyperCubePivotData for pivot table")
 
-                measure_expressions = []
-                for measure_def in hc_def.get('qMeasures', []):
-                    expression = measure_def.get('qDef', {}).get('qDef', '')
-                    if expression:
-                        measure_expressions.append(expression)
+                    # Apply selections if provided (without bookmark)
+                    if selections:
+                        for field_name, field_values in selections.items():
+                            if not isinstance(field_values, list):
+                                field_values = [field_values]
+                            logger.info(f"Applying selection on field '{field_name}' with values: {field_values}")
+                            try:
+                                self.engine_client.select_values(app_handle, field_name, field_values)
+                            except Exception as sel_error:
+                                logger.warning(f"Failed to apply selection on '{field_name}': {str(sel_error)}")
 
-                # Get the visual column order (how columns are displayed in the UI)
-                column_order = hc_def.get('qColumnOrder', [])
-                if not column_order:
-                    # Fallback to natural order if no column order is specified
-                    column_order = list(range(len(dim_fields) + len(measure_expressions)))
+                    # Try to get pivot data directly without bookmark
+                    pivot_data = self.engine_client.get_pivot_data(
+                        app_handle=app_handle,
+                        object_id=object_id,
+                        page=page,
+                        page_size=page_size,
+                        selections={},  # Already applied above
+                        bookmark_id=None  # NO bookmark!
+                    )
 
-                logger.info(f"Object has {len(dim_fields)} dimensions and {len(measure_expressions)} measures")
-                logger.info(f"Visual column order: {column_order}")
+                    should_fallback = False
 
-                logger.info(f"Object hypercube has {total_rows} total rows after bookmark/selections")
+                    if 'error' in pivot_data:
+                        logger.warning(f"Pivot data fetch failed: {pivot_data['error']} - falling back to regular hypercube")
+                        should_fallback = True
+                    else:
+                        # Check if pivot data has all expected dimensions
+                        # If it's collapsed and returning sparse format, it may only have 1 dimension
+                        returned_data = pivot_data.get('data', [])
+                        if returned_data:
+                            first_row_keys = set(returned_data[0].keys())
+                            # Count how many dimension labels are present in the data
+                            dim_labels_in_data = sum(1 for dim_info in hc_layout.get('qDimensionInfo', [])
+                                                    if dim_info.get('qFallbackTitle', '') in first_row_keys)
 
-                # Fetch data directly from the object's hypercube using GetHyperCubeData
-                # Calculate how many rows to fetch
-                # Qlik has a limit on cells per request (~10,000 cells typically)
-                # With 15 columns (12 dims + 3 measures), max safe rows is ~500-600
-                num_columns = len(dim_fields) + len(measure_expressions)
-                max_safe_rows = min(500, 10000 // max(num_columns, 1))  # Conservative limit
+                            logger.info(f"Pivot data returned {dim_labels_in_data} dimensions out of {dim_count} expected")
 
-                fetch_rows = 1000 if filters else page_size
-                fetch_rows = min(fetch_rows, max_safe_rows)  # Cap at safe limit
-                start_row = 0 if filters else (page - 1) * page_size
+                            if dim_labels_in_data >= dim_count:
+                                # All dimensions present, clear selections and return pivot data
+                                if selections:
+                                    try:
+                                        self.engine_client.clear_all(app_handle)
+                                    except Exception:
+                                        pass
+                                pivot_data['app_id'] = app_id
+                                return pivot_data
+                            else:
+                                logger.info(f"Pivot data is incomplete ({dim_labels_in_data}/{dim_count} dimensions) - falling back to regular hypercube for full expansion")
+                                should_fallback = True
+                        else:
+                            # Empty data, clear selections and return pivot result as-is
+                            if selections:
+                                try:
+                                    self.engine_client.clear_all(app_handle)
+                                except Exception:
+                                    pass
+                            pivot_data['app_id'] = app_id
+                            return pivot_data
 
-                # Ensure we don't fetch more than available
-                fetch_rows = min(fetch_rows, total_rows - start_row) if start_row < total_rows else 0
+                    if should_fallback:
+                        # DON'T clear selections - we need them for the session hypercube
+                        logger.info("Creating session object with flat table to get all dimensions")
 
-                data_pages = []
-                if fetch_rows > 0:
-                    logger.info(f"Fetching {fetch_rows} rows starting from row {start_row} ({num_columns} columns)")
+                        # Extract dimension field definitions from the pivot object
+                        dim_defs = []
+                        dim_labels_list = []
+                        for dim_info in hc_layout.get('qDimensionInfo', []):
+                            label = dim_info.get('qFallbackTitle', '')
+                            group_defs = dim_info.get('qGroupFieldDefs', [])
+                            field = group_defs[0] if group_defs else label
 
-                    try:
-                        data_request = self.engine_client.send_request(
-                            'GetHyperCubeData',
-                            ['/qHyperCubeDef', [{'qTop': start_row, 'qLeft': 0, 'qWidth': num_columns, 'qHeight': fetch_rows}]],
-                            handle=obj_handle
+                            if field:  # Skip empty fields
+                                dim_defs.append(field)
+                                dim_labels_list.append(label)
+
+                        # Extract measure definitions from the pivot object
+                        meas_defs = []
+                        meas_labels_list = []
+
+                        # Get the full property tree to access measure expressions
+                        properties = self.engine_client.send_request('GetFullPropertyTree', handle=obj_handle)
+                        prop_entry = properties.get('qPropEntry', {})
+                        prop_property = prop_entry.get('qProperty', {})
+                        hc_def = prop_property.get('qHyperCubeDef', {})
+
+                        logger.info(f"Found {len(hc_def.get('qMeasures', []))} measure definitions in pivot")
+
+                        for i, meas_def in enumerate(hc_def.get('qMeasures', [])):
+                            qdef = meas_def.get('qDef', {})
+                            expression = qdef.get('qDef', '')
+                            label = qdef.get('qLabel', '')
+                            library_id = meas_def.get('qLibraryId', '')
+
+                            logger.info(f"Measure {i}: expression='{expression}', label='{label}', library_id='{library_id}'")
+
+                            # Store the measure definition (either library ID or expression)
+                            if library_id or expression:
+                                # We'll pass the entire measure definition to preserve library references
+                                meas_defs.append(meas_def)
+                                meas_labels_list.append(label if label else f"Measure_{i}")
+                                logger.info(f"Measure {i} added: library_id={library_id}, has_expression={bool(expression)}")
+
+                        # Get measure labels from layout (more reliable)
+                        for i, meas_info in enumerate(hc_layout.get('qMeasureInfo', [])):
+                            label = meas_info.get('qFallbackTitle', '')
+                            if label:
+                                # Add measure if not yet added
+                                if i >= len(meas_labels_list):
+                                    # Get expression from qMeasureInfo if available
+                                    expr = meas_info.get('qFallbackTitle', f'Measure_{i}')
+                                    meas_defs.append(f"[{label}]")  # Use field reference
+                                    meas_labels_list.append(label)
+                                else:
+                                    meas_labels_list[i] = label
+
+                        logger.info(f"Creating session hypercube with {len(dim_defs)} dimensions and {len(meas_defs)} measures")
+                        logger.info(f"Dimensions: {dim_labels_list}")
+                        logger.info(f"Measures: {meas_labels_list}")
+
+                        # Create a session object with flat table hypercube
+                        session_obj_def = {
+                            "qInfo": {
+                                "qType": "table"
+                            },
+                            "qHyperCubeDef": {
+                                "qDimensions": [{"qDef": {"qFieldDefs": [field]}} for field in dim_defs],
+                                "qMeasures": meas_defs,  # Use full measure definitions (preserves library IDs)
+                                "qMode": "S",  # S = Straight table (not P = Pivot)
+                                "qSuppressZero": False,
+                                "qSuppressMissing": False,
+                                "qInitialDataFetch": [{"qTop": 0, "qLeft": 0, "qHeight": 0, "qWidth": 0}]
+                            }
+                        }
+
+                        # Create session object
+                        session_obj = self.engine_client.send_request(
+                            'CreateSessionObject',
+                            [session_obj_def],
+                            handle=app_handle
                         )
-                        data_pages = data_request.get('qDataPages', [])
-                    except Exception as e:
-                        if 'too large' in str(e).lower():
-                            logger.warning(f"Result too large error, reducing fetch size from {fetch_rows} to {fetch_rows // 2}")
-                            # Retry with half the rows
-                            fetch_rows = fetch_rows // 2
+                        session_handle = session_obj['qReturn']['qHandle']
+
+                        try:
+                            # Get layout to check total rows
+                            session_layout = self.engine_client.send_request('GetLayout', [], handle=session_handle)
+                            session_hc = session_layout.get('qLayout', {}).get('qHyperCube', {})
+                            session_total_rows = session_hc.get('qSize', {}).get('qcy', 0)
+
+                            logger.info(f"Session hypercube has {session_total_rows} rows")
+
+                            # Fetch data from session object
+                            start_row = (page - 1) * page_size
+                            fetch_rows = min(page_size, session_total_rows - start_row) if start_row < session_total_rows else 0
+
+                            session_data = []
                             if fetch_rows > 0:
+                                total_cols = len(dim_defs) + len(meas_defs)
+                                logger.info(f"Fetching {fetch_rows} rows from session hypercube starting at row {start_row}")
                                 data_request = self.engine_client.send_request(
                                     'GetHyperCubeData',
-                                    ['/qHyperCubeDef', [{'qTop': start_row, 'qLeft': 0, 'qWidth': num_columns, 'qHeight': fetch_rows}]],
-                                    handle=obj_handle
+                                    ['/qHyperCubeDef', [{'qTop': start_row, 'qLeft': 0, 'qWidth': total_cols, 'qHeight': fetch_rows}]],
+                                    handle=session_handle
                                 )
                                 data_pages = data_request.get('qDataPages', [])
+                                if data_pages:
+                                    matrix = data_pages[0].get('qMatrix', [])
+                                    logger.info(f"Session qMatrix returned {len(matrix)} rows with {len(matrix[0]) if matrix else 0} columns")
+                                    if matrix and len(matrix) > 0:
+                                        logger.info(f"First row sample: {matrix[0][:3]}")  # Log first 3 cells
+                                    for row_idx, row in enumerate(matrix):
+                                        row_data = {}
+                                        # Process dimensions
+                                        for col_idx, cell in enumerate(row):
+                                            if col_idx < len(dim_labels_list):
+                                                # Dimension: use qText
+                                                label = dim_labels_list[col_idx]
+                                                value = cell.get('qText', '')
+                                                row_data[label] = value
+                                            elif col_idx < len(dim_labels_list) + len(meas_labels_list):
+                                                # Measure: prefer qNum, fallback to qText
+                                                meas_idx = col_idx - len(dim_labels_list)
+                                                label = meas_labels_list[meas_idx]
+                                                num_val = cell.get('qNum')
+                                                if num_val is not None and str(num_val).lower() not in ('nan', 'inf', '-inf'):
+                                                    row_data[label] = num_val
+                                                else:
+                                                    row_data[label] = cell.get('qText', '')
+                                        if row_idx == 0:  # Log first row for debugging
+                                            logger.info(f"First session row data: {row_data}")
+                                        session_data.append(row_data)
+
+                            # Apply client-side filtering if selections were provided
+                            filtered_data = session_data
+                            if selections and session_data:
+                                logger.info(f"Applying client-side filtering for selections: {selections}")
+                                for sel_field, sel_values in selections.items():
+                                    if not isinstance(sel_values, list):
+                                        sel_values = [sel_values]
+
+                                    # Find which dimension label corresponds to this field
+                                    filter_label = None
+                                    for i, field in enumerate(dim_defs):
+                                        if field == sel_field or dim_labels_list[i] == sel_field:
+                                            filter_label = dim_labels_list[i]
+                                            break
+
+                                    if filter_label:
+                                        logger.info(f"Filtering by {filter_label} in {sel_values}")
+                                        filtered_data = [row for row in filtered_data if str(row.get(filter_label, '')) in [str(v) for v in sel_values]]
+                                        logger.info(f"Filtered from {len(session_data)} to {len(filtered_data)} rows")
+
+                            # Clear selections
+                            if selections:
+                                try:
+                                    self.engine_client.clear_all(app_handle)
+                                except Exception:
+                                    pass
+
+                            # Destroy session object
+                            try:
+                                self.engine_client.send_request('DestroySessionObject', [session_handle], handle=app_handle)
+                            except Exception:
+                                pass
+
+                            # Recalculate pagination based on filtered data
+                            if filtered_data != session_data:
+                                # Client-side filtering was applied - need to fetch more and paginate
+                                # For now, return what we have filtered
+                                total_filtered = len(filtered_data)
+                                total_pages = (total_filtered + page_size - 1) // page_size if page_size > 0 else 1
+                                logger.info(f"Returning {len(filtered_data)} filtered rows out of {total_filtered} total matches")
+                            else:
+                                total_filtered = session_total_rows
+                                total_pages = (session_total_rows + page_size - 1) // page_size if page_size > 0 else 1
+
+                            # Return session data
+                            result = {
+                                'object_id': object_id,
+                                'app_id': app_id,
+                                'data': filtered_data,
+                                'pagination': {
+                                    'page': page,
+                                    'page_size': page_size,
+                                    'total_rows': total_filtered,
+                                    'total_pages': total_pages,
+                                    'has_next': page < total_pages,
+                                    'has_previous': page > 1
+                                }
+                            }
+                            logger.info(f"Returning session hypercube data with {len(filtered_data)} rows")
+                            if filtered_data:
+                                logger.info(f"First row being returned: {filtered_data[0]}")
+                            return result
+                        except Exception as session_err:
+                            logger.error(f"Session hypercube failed: {session_err}")
+                            # Destroy session object on error
+                            try:
+                                self.engine_client.send_request('DestroySessionObject', [session_handle], handle=app_handle)
+                            except Exception:
+                                pass
+                            # Fall through to regular hypercube
+                            use_regular_hypercube = True
+                        # No fall through - return above
+
+                if not use_regular_hypercube and not (is_collapsed_pivot or is_empty_pivot):
+                    # Normal path: not a collapsed/empty pivot, use regular hypercube
+                    use_regular_hypercube = True
+
+                if use_regular_hypercube:
+                    # Extract dimension fields and labels from layout (most reliable source)
+                    dim_fields = []
+                    dim_labels = []
+                    for dim_info in hc_layout.get('qDimensionInfo', []):
+                        # Use qFallbackTitle which contains the correct label
+                        label = dim_info.get('qFallbackTitle', '')
+                        # Get field name from qGroupFieldDefs
+                        group_defs = dim_info.get('qGroupFieldDefs', [])
+                        field = group_defs[0] if group_defs else label
+
+                        dim_fields.append(field)
+                        dim_labels.append(label)
+
+                    # Extract measure labels from layout
+                    measure_labels = []
+                    for meas_info in hc_layout.get('qMeasureInfo', []):
+                        label = meas_info.get('qFallbackTitle', '')
+                        measure_labels.append(label)
+
+                    # We still need to get properties for measure expressions (for field mapping)
+                    # and to get the visual column order
+                    properties = self.engine_client.send_request('GetFullPropertyTree', handle=obj_handle)
+                    # The full property tree has the structure qPropEntry.qProperty.qHyperCubeDef
+                    prop_entry = properties.get('qPropEntry', {})
+                    prop_property = prop_entry.get('qProperty', {})
+                    hc_def = prop_property.get('qHyperCubeDef', {})
+
+                    measure_expressions = []
+                    for measure_def in hc_def.get('qMeasures', []):
+                        expression = measure_def.get('qDef', {}).get('qDef', '')
+                        if expression:
+                            measure_expressions.append(expression)
+
+                    # Get the visual column order (how columns are displayed in the UI)
+                    column_order = hc_def.get('qColumnOrder', [])
+                    if not column_order:
+                        # Fallback to natural order if no column order is specified
+                        column_order = list(range(len(dim_fields) + len(measure_expressions)))
+
+                    logger.info(f"Object has {len(dim_fields)} dimensions and {len(measure_expressions)} measures")
+                    logger.info(f"Visual column order: {column_order}")
+
+                    logger.info(f"Object hypercube has {total_rows} total rows after bookmark/selections")
+
+                    # Fetch data directly from the object's hypercube using GetHyperCubeData
+                    # Calculate how many rows to fetch
+                    # Qlik has a limit on cells per request (~10,000 cells typically)
+                    # With 15 columns (12 dims + 3 measures), max safe rows is ~500-600
+                    num_columns = len(dim_fields) + len(measure_expressions)
+                    max_safe_rows = min(500, 10000 // max(num_columns, 1))  # Conservative limit
+
+                    fetch_rows = 1000 if filters else page_size
+                    fetch_rows = min(fetch_rows, max_safe_rows)  # Cap at safe limit
+                    start_row = 0 if filters else (page - 1) * page_size
+
+                    # Ensure we don't fetch more than available
+                    fetch_rows = min(fetch_rows, total_rows - start_row) if start_row < total_rows else 0
+
+                    data_pages = []
+                    if fetch_rows > 0:
+                        logger.info(f"Fetching {fetch_rows} rows starting from row {start_row} ({num_columns} columns)")
+
+                        try:
+                            data_request = self.engine_client.send_request(
+                                'GetHyperCubeData',
+                                ['/qHyperCubeDef', [{'qTop': start_row, 'qLeft': 0, 'qWidth': num_columns, 'qHeight': fetch_rows}]],
+                                handle=obj_handle
+                            )
+                            data_pages = data_request.get('qDataPages', [])
+                        except Exception as e:
+                            if 'too large' in str(e).lower():
+                                logger.warning(f"Result too large error, reducing fetch size from {fetch_rows} to {fetch_rows // 2}")
+                                # Retry with half the rows
+                                fetch_rows = fetch_rows // 2
+                                if fetch_rows > 0:
+                                    data_request = self.engine_client.send_request(
+                                        'GetHyperCubeData',
+                                        ['/qHyperCubeDef', [{'qTop': start_row, 'qLeft': 0, 'qWidth': num_columns, 'qHeight': fetch_rows}]],
+                                        handle=obj_handle
+                                    )
+                                    data_pages = data_request.get('qDataPages', [])
+                                else:
+                                    raise
                             else:
                                 raise
-                        else:
-                            raise
 
-                all_rows = []
-                if data_pages:
-                    matrix = data_pages[0].get('qMatrix', [])
+                    all_rows = []
+                    if data_pages:
+                        matrix = data_pages[0].get('qMatrix', [])
 
-                    # Create combined list of all labels (dims + measures) in hypercube order
-                    all_labels = dim_labels + measure_labels
+                        # Create combined list of all labels (dims + measures) in hypercube order
+                        all_labels = dim_labels + measure_labels
 
-                    # IMPORTANT: qMatrix returns data cells in VISUAL column order, not hypercube order!
-                    # We need to create a reverse mapping: hypercube_column -> cell_index
-                    hypercube_to_cell = {}
-                    for cell_index, hypercube_column in enumerate(column_order):
-                        hypercube_to_cell[hypercube_column] = cell_index
+                        # IMPORTANT: qMatrix returns data cells in VISUAL column order, not hypercube order!
+                        # We need to create a reverse mapping: hypercube_column -> cell_index
+                        hypercube_to_cell = {}
+                        for cell_index, hypercube_column in enumerate(column_order):
+                            hypercube_to_cell[hypercube_column] = cell_index
 
-                    for row in matrix:
-                        row_data = {}
+                        for row in matrix:
+                            row_data = {}
 
-                        # Iterate through all labels in their hypercube order
-                        # and map each to its corresponding cell based on column_order
-                        for hypercube_column in range(len(all_labels)):
-                            if hypercube_column not in hypercube_to_cell:
-                                continue
+                            # Iterate through all labels in their hypercube order
+                            # and map each to its corresponding cell based on column_order
+                            for hypercube_column in range(len(all_labels)):
+                                if hypercube_column not in hypercube_to_cell:
+                                    continue
 
-                            cell_index = hypercube_to_cell[hypercube_column]
-                            if cell_index >= len(row):
-                                continue
+                                cell_index = hypercube_to_cell[hypercube_column]
+                                if cell_index >= len(row):
+                                    continue
 
-                            label = all_labels[hypercube_column]
-                            cell = row[cell_index]
+                                label = all_labels[hypercube_column]
+                                cell = row[cell_index]
 
-                            # For dimensions (indices 0 to len(dim_labels)-1), use text
-                            # For measures (indices >= len(dim_labels)), prefer numeric value
-                            if hypercube_column < len(dim_labels):
-                                value = cell.get('qText', '')
-                            else:
-                                value = cell.get('qNum', None)
-                                if value is None or str(value).lower() == 'nan':
+                                # For dimensions (indices 0 to len(dim_labels)-1), use text
+                                # For measures (indices >= len(dim_labels)), prefer numeric value
+                                if hypercube_column < len(dim_labels):
                                     value = cell.get('qText', '')
+                                else:
+                                    value = cell.get('qNum', None)
+                                    if value is None or str(value).lower() == 'nan':
+                                        value = cell.get('qText', '')
 
-                            row_data[label] = value
+                                row_data[label] = value
 
-                        all_rows.append(row_data)
+                            all_rows.append(row_data)
 
-                # Apply client-side filters if provided
-                filtered_rows = all_rows
-                if filters:
-                    # Map field names to their display labels
-                    field_to_label = dict(zip(dim_fields, dim_labels))
+                    # Apply client-side filters if provided
+                    filtered_rows = all_rows
+                    if filters:
+                        # Map field names to their display labels
+                        field_to_label = dict(zip(dim_fields, dim_labels))
 
-                    for field_name, field_value in filters.items():
-                        # Get the label that corresponds to this field
-                        filter_label = field_to_label.get(field_name, field_name)
+                        for field_name, field_value in filters.items():
+                            # Get the label that corresponds to this field
+                            filter_label = field_to_label.get(field_name, field_name)
 
-                        logger.info(f"Filtering by {filter_label} (field: {field_name}) = {field_value}")
-                        filtered_rows = [
-                            row for row in filtered_rows
-                            if str(row.get(filter_label, '')).strip() == str(field_value).strip()
-                        ]
+                            logger.info(f"Filtering by {filter_label} (field: {field_name}) = {field_value}")
+                            filtered_rows = [
+                                row for row in filtered_rows
+                                if str(row.get(filter_label, '')).strip() == str(field_value).strip()
+                            ]
 
-                # Apply pagination to filtered results
-                # If filters were applied, total_rows is the filtered count; otherwise use the object's total
-                pagination_total = len(filtered_rows) if filters else total_rows
+                    # Apply pagination to filtered results
+                    # If filters were applied, total_rows is the filtered count; otherwise use the object's total
+                    pagination_total = len(filtered_rows) if filters else total_rows
 
-                # Use actual fetched rows (might be less than requested page_size due to Qlik limits)
-                actual_page_size = len(filtered_rows) if not filters else page_size
-                total_pages = (pagination_total + actual_page_size - 1) // actual_page_size if pagination_total > 0 else 1
+                    # Use actual fetched rows (might be less than requested page_size due to Qlik limits)
+                    actual_page_size = len(filtered_rows) if not filters else page_size
+                    total_pages = (pagination_total + actual_page_size - 1) // actual_page_size if pagination_total > 0 else 1
 
-                # For filtered data, we already have all rows in memory, so paginate from that
-                # For non-filtered data, we already fetched only the requested page
-                if filters:
-                    offset = (page - 1) * page_size
-                    data_rows = filtered_rows[offset:offset + page_size]
-                else:
-                    data_rows = filtered_rows  # This is already the correct page
+                    # For filtered data, we already have all rows in memory, so paginate from that
+                    # For non-filtered data, we already fetched only the requested page
+                    if filters:
+                        offset = (page - 1) * page_size
+                        data_rows = filtered_rows[offset:offset + page_size]
+                    else:
+                        data_rows = filtered_rows  # This is already the correct page
 
-                logger.info(f"Retrieved {len(data_rows)} rows from object '{object_id}' (page {page}/{total_pages}, total {pagination_total} rows)")
+                    logger.info(f"Retrieved {len(data_rows)} rows from object '{object_id}' (page {page}/{total_pages}, total {pagination_total} rows)")
 
-                return {
-                    'object_id': object_id,
-                    'app_id': app_id,
-                    'data': data_rows,
-                    'pagination': {
-                        'page': page,
-                        'page_size': actual_page_size,  # Return actual size, not requested
-                        'total_rows': pagination_total,
-                        'total_pages': total_pages,
-                        'has_next': page < total_pages,
-                        'has_previous': page > 1
+                    return {
+                        'object_id': object_id,
+                        'app_id': app_id,
+                        'data': data_rows,
+                        'pagination': {
+                            'page': page,
+                            'page_size': actual_page_size,  # Return actual size, not requested
+                            'total_rows': pagination_total,
+                            'total_pages': total_pages,
+                            'has_next': page < total_pages,
+                            'has_previous': page > 1
+                        }
                     }
-                }
 
             finally:
                 # Clear selections if they were applied

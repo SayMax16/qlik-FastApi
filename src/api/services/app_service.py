@@ -140,18 +140,25 @@ class AppService(BaseService):
         if not app_id:
             raise AppNotFoundException(app_name)
 
-        data = await asyncio.to_thread(
-            self.app_repo.get_pivot_object_data,
-            app_id,
-            object_id,
-            page,
-            page_size,
-            selections or {},
-            bookmark_id
-        )
+        try:
+            # Add 10 second timeout using asyncio.wait_for
+            data = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.app_repo.get_pivot_object_data,
+                    app_id,
+                    object_id,
+                    page,
+                    page_size,
+                    selections or {},
+                    bookmark_id
+                ),
+                timeout=10.0
+            )
 
-        data['app_name'] = app_name
-        return data
+            data['app_name'] = app_name
+            return data
+        except asyncio.TimeoutError:
+            raise Exception(f"Request timed out after 10 seconds - pivot table computation is taking too long. Consider using a bookmark to pre-filter the data.")
 
     async def get_object_data(self, app_name: str, object_id: str, page: int = 1, page_size: int = 100, filters: Dict = None, selections: Dict = None, bookmark_id: str = None) -> Dict:
         """Get actual data from an object.

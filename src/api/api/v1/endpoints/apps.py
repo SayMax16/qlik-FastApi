@@ -7,7 +7,108 @@ from src.api.core.config import settings
 router = APIRouter()
 
 # IMPORTANT: More specific routes must come BEFORE generic routes
-# This application_status route must be defined before the generic {table_name} route
+# These specific routes must be defined before the generic {table_name} route
+
+@router.get("/apps/{app_name}/tables/factory_data/data")
+async def get_factory_data(
+    app_name: str = Path(..., description="Application name"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(100, ge=1, le=10000, description="Rows per page"),
+    factory: Optional[str] = Query(None, description="Filter by factory (Завод field), supports multiple values separated by comma"),
+    app_service: AppService = Depends(get_app_service),
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Get factory data with optional factory (Завод) filtering.
+
+    This endpoint retrieves data from the factory_data pivot table (object ID: Dkjpv)
+    and supports filtering by the Завод (factory) field.
+
+    **Examples:**
+
+    Get all data (no filtering):
+    ```
+    GET /api/v1/apps/afko/tables/factory_data/data?page=1&page_size=100
+    ```
+
+    Filter by single factory:
+    ```
+    GET /api/v1/apps/afko/tables/factory_data/data?page=1&page_size=100&factory=1203
+    ```
+
+    Filter by multiple factories:
+    ```
+    GET /api/v1/apps/afko/tables/factory_data/data?page=1&page_size=100&factory=1203,1204
+    ```
+
+    **Response format:**
+    ```json
+    {
+      "object_id": "Dkjpv",
+      "app_id": "...",
+      "app_name": "afko",
+      "data": [
+        {
+          "Field1": "Value1",
+          "Field2": "Value2",
+          ...
+        }
+      ],
+      "pagination": {
+        "page": 1,
+        "page_size": 100,
+        "total_rows": 150,
+        "total_pages": 2,
+        "has_next": true,
+        "has_previous": false
+      }
+    }
+    ```
+    """
+    table_name = "factory_data"
+
+    # Check app access
+    if not settings.can_access_app(api_key, app_name):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your API key does not have access to app '{app_name}'"
+        )
+
+    # Check table access
+    if not settings.can_access_table(api_key, app_name, table_name):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your API key does not have access to table '{table_name}' in app '{app_name}'"
+        )
+
+    # Get object ID for this table
+    object_id = settings.get_object_id_for_table(app_name, table_name)
+    if not object_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No object mapping found for table '{table_name}' in app '{app_name}'"
+        )
+
+    # Build selections dictionary for Qlik filtering
+    selections = {}
+    if factory:
+        # Split comma-separated values
+        factory_values = [f.strip() for f in factory.split(',')]
+        selections['Завод'] = factory_values  # Завод is the factory field in Qlik
+
+    # Fetch data without bookmark - let's see what we get
+    data = await app_service.get_object_data(
+        app_name=app_name,
+        object_id=object_id,
+        page=page,
+        page_size=page_size,
+        filters={},  # No client-side filtering
+        selections=selections,  # Apply Qlik selections for filtering
+        bookmark_id=None  # No bookmark - fetch all data
+    )
+
+    return data
+
 
 @router.get("/apps/{app_name}/tables/application_status/data")
 async def get_application_status_data(

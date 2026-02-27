@@ -85,10 +85,10 @@ class DataRepository(BaseRepository):
                 # Extract hypercube data from the object
                 obj_handle = obj_response.get("qReturn", {}).get("qHandle", -1)
 
-                if obj_handle != -1:
+                if obj_handle not in (-1, None):
                     # Get the object's layout to access its hypercube
                     layout_response = self.engine_client.send_request(
-                        "GetLayout", [], handle=obj_handle
+                        "GetLayout", {}, handle=obj_handle
                     )
 
                     layout = layout_response.get("qLayout", {})

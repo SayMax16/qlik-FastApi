@@ -1174,8 +1174,10 @@ class QlikEngineClient(BaseClient):
             dim_fields = []  # raw field names (used to match selection keys)
             dim_labels = []  # display labels (used as row keys in output)
             for d in hc_def.get("qDimensions", []):
-                label = d.get("qDef", {}).get("qFieldLabels", [None])[0]
-                field = d.get("qDef", {}).get("qFieldDefs", [None])[0]
+                field_defs = d.get("qDef", {}).get("qFieldDefs", [])
+                field_labels = d.get("qDef", {}).get("qFieldLabels", [])
+                field = field_defs[0] if field_defs else None
+                label = field_labels[0] if field_labels else None
                 dim_fields.append(field if field else "")
                 dim_labels.append(label if label else (field if field else ""))
 
@@ -1186,24 +1188,23 @@ class QlikEngineClient(BaseClient):
                 meas_labels.append(label if label else (expr if expr else f"Measure_{i}"))
 
             n_meas = len(meas_labels)
+            n_dims = len(dim_labels)
+
+            # Get qNoOfLeftDims to know how many dimensions are on the left
+            q_no_of_left_dims = hc_def.get("qNoOfLeftDims", n_dims)
 
             # GetLayout to know total row count (very fast — reads cached state)
             layout = self.send_request("GetLayout", [], handle=obj_handle)
             hc = layout.get("qLayout", {}).get("qHyperCube", {})
             total_rows = hc.get("qSize", {}).get("qcy", 0)
 
-            logger.info(f"Pivot object '{object_id}' has {total_rows} rows total")
+            logger.info(f"Pivot object '{object_id}' qSize reports {total_rows} rows")
+            logger.info(f"Pivot has {n_dims} dimensions and {n_meas} measures")
+            logger.info(f"Pivot qNoOfLeftDims: {q_no_of_left_dims}")
 
-            if total_rows == 0:
-                return {
-                    "object_id": object_id,
-                    "data": [],
-                    "pagination": {
-                        "page": page, "page_size": page_size,
-                        "total_rows": 0, "total_pages": 1,
-                        "has_next": False, "has_previous": False
-                    }
-                }
+            # For pivot tables, qSize can be 0 even when data exists
+            # We need to actually fetch the data to know if there are rows
+            # So we'll proceed with the fetch regardless of qSize
 
             # Determine how many rows to fetch from Qlik.
             # If client-side filters are requested we must fetch ALL rows so we
@@ -1217,6 +1218,8 @@ class QlikEngineClient(BaseClient):
                 f"top={fetch_offset}, height={fetch_height}"
             )
 
+            logger.info(f"Requesting pivot data: qTop={fetch_offset}, qHeight={fetch_height}, qWidth={max(n_meas, 1)}, qLeft={q_no_of_left_dims}")
+
             data_resp = self.send_request(
                 "GetHyperCubePivotData",
                 [
@@ -1227,11 +1230,27 @@ class QlikEngineClient(BaseClient):
             )
 
             pages_data = data_resp.get("qDataPages", [])
+            logger.info(f"Received {len(pages_data)} data pages from pivot")
             flat_rows = []
 
-            if pages_data:
+            if pages_data and len(pages_data) > 0:
                 q_left = pages_data[0].get("qLeft", [])
                 q_data = pages_data[0].get("qData", [])
+
+                # Log the structure of qLeft to understand the format
+                if q_left:
+                    logger.info(f"qLeft has {len(q_left)} entries")
+                    logger.info(f"First qLeft entry type: {type(q_left[0])}")
+                    if isinstance(q_left[0], list):
+                        logger.info(f"First qLeft entry is a list with {len(q_left[0])} items")
+                        if q_left[0]:
+                            logger.info(f"First item in first qLeft: {q_left[0][0]}")
+                    elif isinstance(q_left[0], dict):
+                        logger.info(f"First qLeft entry is a dict: {q_left[0]}")
+
+                    # Sample first 3 qLeft entries for analysis
+                    for i, left_entry in enumerate(q_left[:3]):
+                        logger.info(f"qLeft[{i}]: {left_entry}")
 
                 # Check if the response uses nested qSubNodes tree format
                 # (returned when bookmark/filter is applied and pivot shows full hierarchy)
