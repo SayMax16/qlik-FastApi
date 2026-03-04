@@ -16,6 +16,7 @@ async def get_factory_data(
     page_size: int = Query(100, ge=1, le=10000, description="Rows per page"),
     factory: Optional[str] = Query(None, description="Filter by factory (Завод field), supports multiple values separated by comma"),
     warehouse: Optional[str] = Query(None, description="Filter by warehouse (Склад field), supports multiple values separated by comma"),
+    typeOM: Optional[str] = Query(None, description="Filter by OM type (Тип ОМ field), supports multiple values separated by comma"),
     MeasureType: Optional[str] = Query(None, description="Measure type (1=qty, 2=amount, 3=amount-qty)"),
     Currency: Optional[str] = Query(None, description="Currency type (1=ZUD, 2=UZS, 3=ZUDMVP)"),
     app_service: AppService = Depends(get_app_service),
@@ -50,9 +51,14 @@ async def get_factory_data(
     GET /api/v1/apps/afko/tables/factory_data/data?page=1&page_size=100&warehouse=A100
     ```
 
-    Filter by factory and warehouse with variables:
+    Filter by OM type:
     ```
-    GET /api/v1/apps/afko/tables/factory_data/data?page=1&page_size=100&factory=1203&warehouse=A100&MeasureType=1&Currency=2
+    GET /api/v1/apps/afko/tables/factory_data/data?page=1&page_size=100&typeOM=Type1
+    ```
+
+    Filter by factory, warehouse, and OM type with variables:
+    ```
+    GET /api/v1/apps/afko/tables/factory_data/data?page=1&page_size=100&factory=1203&warehouse=A100&typeOM=Type1&MeasureType=1&Currency=2
     ```
 
     **Response format:**
@@ -114,6 +120,11 @@ async def get_factory_data(
         # Split comma-separated values
         warehouse_values = [w.strip() for w in warehouse.split(',')]
         selections['Склад'] = warehouse_values  # Склад is the warehouse field in Qlik
+
+    if typeOM:
+        # Split comma-separated values
+        typeOM_values = [t.strip() for t in typeOM.split(',')]
+        selections['Тип ОМ'] = typeOM_values  # Тип ОМ is the OM type field in Qlik
 
     # Build variables dictionary
     variables = {}
