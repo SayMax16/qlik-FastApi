@@ -612,46 +612,96 @@ class AppRepository(BaseRepository):
 
                             logger.info(f"Session hypercube has {session_total_rows} rows")
 
-                            # Fetch data from session object
-                            start_row = (page - 1) * page_size
-                            fetch_rows = min(page_size, session_total_rows - start_row) if start_row < session_total_rows else 0
+                            # Determine if we need client-side filtering
+                            need_client_side_filtering = bool(filters) or bool(selections)
 
                             session_data = []
-                            if fetch_rows > 0:
-                                total_cols = len(dim_defs) + len(meas_defs)
-                                logger.info(f"Fetching {fetch_rows} rows from session hypercube starting at row {start_row}")
-                                data_request = self.engine_client.send_request(
-                                    'GetHyperCubeData',
-                                    ['/qHyperCubeDef', [{'qTop': start_row, 'qLeft': 0, 'qWidth': total_cols, 'qHeight': fetch_rows}]],
-                                    handle=session_handle
-                                )
-                                data_pages = data_request.get('qDataPages', [])
-                                if data_pages:
-                                    matrix = data_pages[0].get('qMatrix', [])
-                                    logger.info(f"Session qMatrix returned {len(matrix)} rows with {len(matrix[0]) if matrix else 0} columns")
-                                    if matrix and len(matrix) > 0:
-                                        logger.info(f"First row sample: {matrix[0][:3]}")  # Log first 3 cells
-                                    for row_idx, row in enumerate(matrix):
-                                        row_data = {}
-                                        # Process dimensions
-                                        for col_idx, cell in enumerate(row):
-                                            if col_idx < len(dim_labels_list):
-                                                # Dimension: use qText
-                                                label = dim_labels_list[col_idx]
-                                                value = cell.get('qText', '')
-                                                row_data[label] = value
-                                            elif col_idx < len(dim_labels_list) + len(meas_labels_list):
-                                                # Measure: prefer qNum, fallback to qText
-                                                meas_idx = col_idx - len(dim_labels_list)
-                                                label = meas_labels_list[meas_idx]
-                                                num_val = cell.get('qNum')
-                                                if num_val is not None and str(num_val).lower() not in ('nan', 'inf', '-inf'):
-                                                    row_data[label] = num_val
-                                                else:
-                                                    row_data[label] = cell.get('qText', '')
-                                        if row_idx == 0:  # Log first row for debugging
-                                            logger.info(f"First session row data: {row_data}")
-                                        session_data.append(row_data)
+                            total_cols = len(dim_defs) + len(meas_defs)
+
+                            if need_client_side_filtering:
+                                # Fetch ALL rows in batches for client-side filtering
+                                logger.info(f"Client-side filtering needed - fetching all {session_total_rows} rows in batches")
+                                CHUNK_SIZE = 1000  # Smaller chunks to avoid "Result too large"
+                                current_row = 0
+
+                                while current_row < session_total_rows:
+                                    fetch_rows = min(CHUNK_SIZE, session_total_rows - current_row)
+                                    logger.info(f"Fetching batch: rows {current_row} to {current_row + fetch_rows - 1}")
+
+                                    data_request = self.engine_client.send_request(
+                                        'GetHyperCubeData',
+                                        ['/qHyperCubeDef', [{'qTop': current_row, 'qLeft': 0, 'qWidth': total_cols, 'qHeight': fetch_rows}]],
+                                        handle=session_handle
+                                    )
+                                    data_pages = data_request.get('qDataPages', [])
+                                    if data_pages:
+                                        matrix = data_pages[0].get('qMatrix', [])
+                                        logger.info(f"Batch returned {len(matrix)} rows with {len(matrix[0]) if matrix else 0} columns")
+
+                                        for row_idx, row in enumerate(matrix):
+                                            row_data = {}
+                                            # Process dimensions
+                                            for col_idx, cell in enumerate(row):
+                                                if col_idx < len(dim_labels_list):
+                                                    # Dimension: use qText
+                                                    label = dim_labels_list[col_idx]
+                                                    value = cell.get('qText', '')
+                                                    row_data[label] = value
+                                                elif col_idx < len(dim_labels_list) + len(meas_labels_list):
+                                                    # Measure: prefer qNum, fallback to qText
+                                                    meas_idx = col_idx - len(dim_labels_list)
+                                                    label = meas_labels_list[meas_idx]
+                                                    num_val = cell.get('qNum')
+                                                    if num_val is not None and str(num_val).lower() not in ('nan', 'inf', '-inf'):
+                                                        row_data[label] = num_val
+                                                    else:
+                                                        row_data[label] = cell.get('qText', '')
+                                            if current_row == 0 and row_idx == 0:  # Log first row for debugging
+                                                logger.info(f"First session row data: {row_data}")
+                                            session_data.append(row_data)
+
+                                    current_row += fetch_rows
+
+                                logger.info(f"Fetched total of {len(session_data)} rows for client-side filtering")
+                            else:
+                                # No filtering needed - fetch only requested page
+                                start_row = (page - 1) * page_size
+                                fetch_rows = min(page_size, session_total_rows - start_row) if start_row < session_total_rows else 0
+
+                                if fetch_rows > 0:
+                                    logger.info(f"Fetching {fetch_rows} rows from session hypercube starting at row {start_row}")
+                                    data_request = self.engine_client.send_request(
+                                        'GetHyperCubeData',
+                                        ['/qHyperCubeDef', [{'qTop': start_row, 'qLeft': 0, 'qWidth': total_cols, 'qHeight': fetch_rows}]],
+                                        handle=session_handle
+                                    )
+                                    data_pages = data_request.get('qDataPages', [])
+                                    if data_pages:
+                                        matrix = data_pages[0].get('qMatrix', [])
+                                        logger.info(f"Session qMatrix returned {len(matrix)} rows with {len(matrix[0]) if matrix else 0} columns")
+                                        if matrix and len(matrix) > 0:
+                                            logger.info(f"First row sample: {matrix[0][:3]}")  # Log first 3 cells
+                                        for row_idx, row in enumerate(matrix):
+                                            row_data = {}
+                                            # Process dimensions
+                                            for col_idx, cell in enumerate(row):
+                                                if col_idx < len(dim_labels_list):
+                                                    # Dimension: use qText
+                                                    label = dim_labels_list[col_idx]
+                                                    value = cell.get('qText', '')
+                                                    row_data[label] = value
+                                                elif col_idx < len(dim_labels_list) + len(meas_labels_list):
+                                                    # Measure: prefer qNum, fallback to qText
+                                                    meas_idx = col_idx - len(dim_labels_list)
+                                                    label = meas_labels_list[meas_idx]
+                                                    num_val = cell.get('qNum')
+                                                    if num_val is not None and str(num_val).lower() not in ('nan', 'inf', '-inf'):
+                                                        row_data[label] = num_val
+                                                    else:
+                                                        row_data[label] = cell.get('qText', '')
+                                            if row_idx == 0:  # Log first row for debugging
+                                                logger.info(f"First session row data: {row_data}")
+                                            session_data.append(row_data)
 
                             # Apply client-side filtering if selections were provided
                             filtered_data = session_data
@@ -673,6 +723,44 @@ class AppRepository(BaseRepository):
                                         filtered_data = [row for row in filtered_data if str(row.get(filter_label, '')) in [str(v) for v in sel_values]]
                                         logger.info(f"Filtered from {len(session_data)} to {len(filtered_data)} rows")
 
+                            # Apply client-side filtering for yearMonth (from filters dict)
+                            if filters and 'yearMonth' in filters and session_data:
+                                year_months = filters['yearMonth']
+                                logger.info(f"Applying client-side yearMonth filtering: {year_months}")
+
+                                # Find the date field label (likely "Дата")
+                                date_label = None
+                                for label in dim_labels_list:
+                                    if 'дата' in label.lower() or 'date' in label.lower():
+                                        date_label = label
+                                        break
+
+                                if date_label:
+                                    logger.info(f"Using date field '{date_label}' for yearMonth filtering")
+
+                                    def matches_year_month(date_str, target_year_months):
+                                        """Check if date_str (DD.MM.YYYY) matches any target year-month (YYYY-MM)"""
+                                        if not date_str:
+                                            return False
+                                        try:
+                                            # Parse DD.MM.YYYY format
+                                            parts = date_str.strip().split('.')
+                                            if len(parts) == 3:
+                                                day, month, year = parts
+                                                # Create YYYY-MM format
+                                                row_year_month = f"{year}-{month.zfill(2)}"
+                                                return row_year_month in target_year_months
+                                        except Exception as e:
+                                            logger.warning(f"Failed to parse date '{date_str}': {e}")
+                                            return False
+                                        return False
+
+                                    before_filter = len(filtered_data)
+                                    filtered_data = [row for row in filtered_data if matches_year_month(row.get(date_label, ''), year_months)]
+                                    logger.info(f"YearMonth filter: {before_filter} rows -> {len(filtered_data)} rows")
+                                else:
+                                    logger.warning("Could not find date field for yearMonth filtering")
+
                             # Clear selections
                             if selections:
                                 try:
@@ -686,22 +774,26 @@ class AppRepository(BaseRepository):
                             except Exception:
                                 pass
 
-                            # Recalculate pagination based on filtered data
-                            if filtered_data != session_data:
-                                # Client-side filtering was applied - need to fetch more and paginate
-                                # For now, return what we have filtered
-                                total_filtered = len(filtered_data)
-                                total_pages = (total_filtered + page_size - 1) // page_size if page_size > 0 else 1
-                                logger.info(f"Returning {len(filtered_data)} filtered rows out of {total_filtered} total matches")
+                            # Paginate the filtered data
+                            total_filtered = len(filtered_data)
+                            total_pages = (total_filtered + page_size - 1) // page_size if page_size > 0 else 1
+
+                            # Apply pagination to filtered data
+                            start_idx = (page - 1) * page_size
+                            end_idx = start_idx + page_size
+                            paginated_data = filtered_data[start_idx:end_idx]
+
+                            if need_client_side_filtering:
+                                logger.info(f"Client-side filtering applied: {len(session_data)} total rows -> {total_filtered} filtered rows")
+                                logger.info(f"Returning page {page} with {len(paginated_data)} rows (indices {start_idx} to {end_idx - 1})")
                             else:
-                                total_filtered = session_total_rows
-                                total_pages = (session_total_rows + page_size - 1) // page_size if page_size > 0 else 1
+                                logger.info(f"No filtering applied: returning page {page} with {len(paginated_data)} rows")
 
                             # Return session data
                             result = {
                                 'object_id': object_id,
                                 'app_id': app_id,
-                                'data': filtered_data,
+                                'data': paginated_data,
                                 'pagination': {
                                     'page': page,
                                     'page_size': page_size,
@@ -711,9 +803,9 @@ class AppRepository(BaseRepository):
                                     'has_previous': page > 1
                                 }
                             }
-                            logger.info(f"Returning session hypercube data with {len(filtered_data)} rows")
-                            if filtered_data:
-                                logger.info(f"First row being returned: {filtered_data[0]}")
+                            logger.info(f"Returning session hypercube data with {len(paginated_data)} rows")
+                            if paginated_data:
+                                logger.info(f"First row being returned: {paginated_data[0]}")
                             return result
                         except Exception as session_err:
                             logger.error(f"Session hypercube failed: {session_err}")

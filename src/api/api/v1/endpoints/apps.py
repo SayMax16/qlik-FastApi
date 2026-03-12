@@ -17,6 +17,7 @@ async def get_factory_data(
     factory: Optional[str] = Query(None, description="Filter by factory (Завод field), supports multiple values separated by comma"),
     warehouse: Optional[str] = Query(None, description="Filter by warehouse (Склад field), supports multiple values separated by comma"),
     typeOM: Optional[str] = Query(None, description="Filter by OM type (Тип ОМ field), supports multiple values separated by comma"),
+    yearMonth: Optional[str] = Query(None, description="Filter by YearMonth (format: 2024-01 or 2024.01), supports multiple values separated by comma"),
     MeasureType: Optional[str] = Query(None, description="Measure type (1=qty, 2=amount, 3=amount-qty)"),
     Currency: Optional[str] = Query(None, description="Currency type (1=ZUD, 2=UZS, 3=ZUDMVP)"),
     app_service: AppService = Depends(get_app_service),
@@ -109,7 +110,11 @@ async def get_factory_data(
             detail=f"No object mapping found for table '{table_name}' in app '{app_name}'"
         )
 
+    # Get bookmark ID for this table (applies 3-month filter first)
+    bookmark_id = settings.get_bookmark_id(app_name, table_name)
+
     # Build selections dictionary for Qlik filtering
+    # NOTE: yearMonth is NOT included in selections - it will be filtered client-side
     selections = {}
     if factory:
         # Split comma-separated values
@@ -126,6 +131,20 @@ async def get_factory_data(
         typeOM_values = [t.strip() for t in typeOM.split(',')]
         selections['Тип ОМ'] = typeOM_values  # Тип ОМ is the OM type field in Qlik
 
+    # Build filters dictionary for client-side filtering
+    # yearMonth will be filtered by parsing the Дата (Date) field after fetching from Qlik
+    filters = {}
+    if yearMonth:
+        # Parse yearMonth values for client-side filtering
+        # Input format: "2024-01" or "2024.01"
+        year_month_list = []
+        for ym in yearMonth.split(','):
+            ym = ym.strip()
+            # Normalize to YYYY-MM format
+            ym_normalized = ym.replace('.', '-')
+            year_month_list.append(ym_normalized)
+        filters['yearMonth'] = year_month_list
+
     # Build variables dictionary
     variables = {}
     if MeasureType:
@@ -133,16 +152,17 @@ async def get_factory_data(
     if Currency:
         variables['vChooseCur'] = Currency
 
-    # Fetch data without bookmark - let's see what we get
+    # Fetch data with bookmark applied first (filters to 3 months), then apply selections
+    # yearMonth is filtered client-side by parsing the Дата field
     data = await app_service.get_object_data(
         app_name=app_name,
         object_id=object_id,
         page=page,
         page_size=page_size,
-        filters={},  # No client-side filtering
+        filters=filters,  # Client-side filtering (yearMonth by Дата field)
         selections=selections,  # Apply Qlik selections for filtering
         variables=variables,  # Apply Qlik variables
-        bookmark_id=None  # No bookmark - fetch all data
+        bookmark_id=bookmark_id  # Apply bookmark FIRST to filter to 3 months
     )
 
     return data
