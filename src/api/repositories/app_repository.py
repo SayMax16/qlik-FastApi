@@ -621,7 +621,12 @@ class AppRepository(BaseRepository):
                             if need_client_side_filtering:
                                 # Fetch ALL rows in batches for client-side filtering
                                 logger.info(f"Client-side filtering needed - fetching all {session_total_rows} rows in batches")
-                                CHUNK_SIZE = 1000  # Smaller chunks to avoid "Result too large"
+                                # Calculate optimal chunk size based on column count
+                                # Qlik has a cell limit per request - typically around 10,000 cells
+                                # Adjust chunk size dynamically to maximize throughput while staying safe
+                                MAX_CELLS = 10000  # Conservative limit based on Qlik Engine constraints
+                                CHUNK_SIZE = min(2000, MAX_CELLS // max(total_cols, 1))  # Cap at 2000 rows max
+                                logger.info(f"Calculated chunk size: {CHUNK_SIZE} rows (columns: {total_cols}, max cells: {MAX_CELLS})")
                                 current_row = 0
 
                                 while current_row < session_total_rows:
