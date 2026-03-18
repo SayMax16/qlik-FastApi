@@ -1,8 +1,13 @@
 from fastapi import APIRouter, Depends, Path, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from typing import Optional, List
 from src.api.services.app_service import AppService
 from src.api.core.dependencies import get_app_service, verify_api_key
 from src.api.core.config import settings
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from io import BytesIO
+from datetime import datetime
 
 router = APIRouter()
 
@@ -166,6 +171,163 @@ async def get_factory_data(
     )
 
     return data
+
+
+@router.get("/apps/{app_name}/tables/factory_data/export")
+async def export_factory_data_to_excel(
+    app_name: str = Path(..., description="Application name"),
+    factory: Optional[str] = Query(None, description="Filter by factory (Завод field), supports multiple values separated by comma"),
+    warehouse: Optional[str] = Query(None, description="Filter by warehouse (Склад field), supports multiple values separated by comma"),
+    typeOM: Optional[str] = Query(None, description="Filter by OM type (Тип ОМ field), supports multiple values separated by comma"),
+    yearMonth: Optional[str] = Query(None, description="Filter by YearMonth (format: 2024-01 or 2024.01), supports multiple values separated by comma"),
+    MeasureType: Optional[str] = Query(None, description="Measure type (1=qty, 2=amount, 3=amount-qty)"),
+    Currency: Optional[str] = Query(None, description="Currency type (1=ZUD, 2=UZS, 3=ZUDMVP)"),
+    app_service: AppService = Depends(get_app_service),
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Export factory data to Excel file.
+
+    This endpoint exports all factory data (with applied filters) to an Excel file.
+    The Excel file includes formatted headers and all data rows.
+
+    **Examples:**
+
+    Export all data for factory 1203:
+    ```
+    GET /api/v1/apps/afko/tables/factory_data/export?factory=1203
+    ```
+
+    Export with multiple filters:
+    ```
+    GET /api/v1/apps/afko/tables/factory_data/export?factory=1203&yearMonth=2026-03&typeOM=Отгрузка в РЦ
+    ```
+    """
+
+    # Get bookmark ID for this table
+    table_name = "factory_data"
+    bookmark_id = settings.get_bookmark_id(app_name, table_name)
+
+    # Build selections dictionary (same as JSON endpoint)
+    selections = {}
+    if factory:
+        factory_values = [f.strip() for f in factory.split(',')]
+        selections['Завод'] = factory_values
+
+    if warehouse:
+        warehouse_values = [w.strip() for w in warehouse.split(',')]
+        selections['Склад'] = warehouse_values
+
+    if typeOM:
+        typeOM_values = [t.strip() for t in typeOM.split(',')]
+        selections['Тип ОМ'] = typeOM_values
+
+    # Build filters dictionary for client-side filtering
+    filters = {}
+    if yearMonth:
+        yearMonth_values = [ym.strip().replace('.', '-') for ym in yearMonth.split(',')]
+        filters['yearMonth'] = yearMonth_values
+
+    # Build variables dictionary
+    variables = {}
+    if MeasureType:
+        variables['vChooseType'] = MeasureType
+    if Currency:
+        variables['vChooseCur'] = Currency
+
+    # Check app access
+    if not settings.can_access_app(api_key, app_name):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your API key does not have access to app '{app_name}'"
+        )
+
+    # Check table access
+    if not settings.can_access_table(api_key, app_name, table_name):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your API key does not have access to table '{table_name}' in app '{app_name}'"
+        )
+
+    # Get object ID for this table
+    object_id = settings.get_object_id_for_table(app_name, table_name)
+    if not object_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No object mapping found for table '{table_name}' in app '{app_name}'"
+        )
+
+    data = await app_service.get_object_data(
+        app_name=app_name,
+        object_id=object_id,
+        page=1,
+        page_size=100000,  # Fetch all data
+        filters=filters,
+        selections=selections,
+        variables=variables,
+        bookmark_id=bookmark_id
+    )
+
+    # Create Excel workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Factory Data"
+
+    # Get data rows
+    rows = data.get('data', [])
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No data found for the given filters")
+
+    # Get column headers from first row
+    headers = list(rows[0].keys())
+
+    # Style for headers
+    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    header_alignment = Alignment(horizontal="center", vertical="center")
+
+    # Write headers
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_alignment
+
+    # Write data rows
+    for row_idx, row_data in enumerate(rows, start=2):
+        for col_idx, header in enumerate(headers, start=1):
+            value = row_data.get(header, '')
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    # Auto-adjust column widths
+    for column in ws.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = min(max_length + 2, 50)  # Cap at 50
+        ws.column_dimensions[column_letter].width = adjusted_width
+
+    # Save to BytesIO
+    excel_file = BytesIO()
+    wb.save(excel_file)
+    excel_file.seek(0)
+
+    # Generate filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"factory_data_{timestamp}.xlsx"
+
+    # Return as streaming response
+    return StreamingResponse(
+        excel_file,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 
 @router.get("/apps/{app_name}/tables/application_status/data")
