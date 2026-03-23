@@ -465,15 +465,6 @@ async def export_factory_data_native(
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={"Content-Disposition": f"attachment; filename={download_filename}"}
         )
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 503 and attempt < max_retries - 1:
-                        # File not ready yet, wait and retry
-                        await asyncio.sleep(retry_delay)
-                        retry_delay *= 2  # Exponential backoff
-                        continue
-                    else:
-                        # Max retries reached or different error
-                        raise
 
     except Exception as e:
         raise HTTPException(
