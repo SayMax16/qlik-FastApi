@@ -4,6 +4,7 @@ from typing import Optional, List
 from src.api.services.app_service import AppService
 from src.api.core.dependencies import get_app_service, verify_api_key
 from src.api.core.config import settings
+from src.api.clients.qlik_engine import QlikEngineClient
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from io import BytesIO
@@ -228,6 +229,11 @@ async def export_factory_data_to_excel(
         yearMonth_values = [ym.strip().replace('.', '-') for ym in yearMonth.split(',')]
         filters['yearMonth'] = yearMonth_values
 
+    # Force full dimension expansion for Excel export
+    # Set a dummy filter that will force session hypercube creation
+    # This ensures we always get all 7 dimensions, not just the 5 visible in pivot
+    filters['_force_session_hypercube'] = True
+
     # Build variables dictionary
     variables = {}
     if MeasureType:
@@ -257,11 +263,13 @@ async def export_factory_data_to_excel(
             detail=f"No object mapping found for table '{table_name}' in app '{app_name}'"
         )
 
+    # For export, we want ALL data without pagination limits
+    # Set page_size to a very large number to ensure we get everything
     data = await app_service.get_object_data(
         app_name=app_name,
         object_id=object_id,
         page=1,
-        page_size=100000,  # Fetch all data
+        page_size=999999999,  # Effectively unlimited - get ALL rows
         filters=filters,
         selections=selections,
         variables=variables,
@@ -328,6 +336,156 @@ async def export_factory_data_to_excel(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
+
+@router.get("/apps/{app_name}/tables/factory_data/export_native")
+async def export_factory_data_native(
+    app_name: str = Path(..., description="Application name"),
+    factory: Optional[str] = Query(None, description="Filter by factory (Завод field), supports multiple values separated by comma"),
+    warehouse: Optional[str] = Query(None, description="Filter by warehouse (Склад field), supports multiple values separated by comma"),
+    typeOM: Optional[str] = Query(None, description="Filter by OM type (Тип ОМ field), supports multiple values separated by comma"),
+    yearMonth: Optional[str] = Query(None, description="Filter by YearMonth (format: 2024-01 or 2024.01), supports multiple values separated by comma"),
+    MeasureType: Optional[str] = Query(None, description="Measure type (1=qty, 2=amount, 3=amount-qty)"),
+    Currency: Optional[str] = Query(None, description="Currency type (1=ZUD, 2=UZS, 3=ZUDMVP)"),
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Export factory data using Qlik's native ExportData method (MUCH FASTER).
+
+    This endpoint uses Qlik Sense's built-in ExportData API which can export
+    up to 1 million rows per sheet directly to Excel format.
+
+    **This is significantly faster than the regular export endpoint for large datasets.**
+    """
+    table_name = "factory_data_table"  # Use the flat table object, not pivot
+
+    # Check app access
+    if not settings.can_access_app(api_key, app_name):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your API key does not have access to app '{app_name}'"
+        )
+
+    # Check table access (use factory_data for access control)
+    if not settings.can_access_table(api_key, app_name, "factory_data"):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your API key does not have access to factory_data table in app '{app_name}'"
+        )
+
+    # Get object ID for the table object
+    object_id = settings.get_object_id_for_table(app_name, table_name)
+    if not object_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No object mapping found for table '{table_name}' in app '{app_name}'"
+        )
+
+    # Get app ID
+    app_id = settings.get_app_id(app_name)
+    if not app_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"App '{app_name}' not found in configuration"
+        )
+
+    # Get bookmark ID
+    bookmark_id = settings.get_bookmark_id(app_name, "factory_data")
+
+    # Create Qlik Engine client
+    client = QlikEngineClient(settings)
+
+    try:
+        # Connect and open app
+        client.connect()
+        result = client.open_doc(app_id, no_data=False)
+        app_handle = result['qReturn']['qHandle']
+
+        # Apply bookmark if specified
+        if bookmark_id:
+            client.send_request('ApplyBookmark', [bookmark_id], handle=app_handle)
+
+        # Apply selections for filtering
+        if factory:
+            factory_values = [f.strip() for f in factory.split(',')]
+            for value in factory_values:
+                client.send_request('SelectValues', ['/qHyperCubeDef', [{"qText": value}], False], handle=app_handle)
+
+        # Get object handle
+        obj_result = client.send_request('GetObject', [object_id], handle=app_handle)
+        obj_handle = obj_result['qReturn']['qHandle']
+
+        # Use native ExportData method
+        export_result = client.export_data(
+            object_handle=obj_handle,
+            file_type="OOXML",  # Excel format
+            path="/qHyperCubeDef",
+            export_state="A"  # All values
+        )
+
+        # Get the temporary URL
+        temp_url = export_result.get('qUrl')
+        if not temp_url:
+            raise HTTPException(
+                status_code=500,
+                detail="Qlik did not return a download URL"
+            )
+
+        # Parse the file path from qUrl
+        # Format: /tempcontent/GUID1/GUID2.xlsx?serverNodeId=...
+        from pathlib import Path
+        parts = temp_url.strip('/').split('/')
+        guid_folder = parts[1]
+        filename_with_params = parts[2]
+        filename = filename_with_params.split('?')[0]  # Remove query params
+
+        # Direct filesystem access (when API runs on same server as Qlik)
+        # Standard Qlik TempContent location on Windows
+        base_path = Path("C:/ProgramData/Qlik/Sense/Repository/TempContent")
+        file_path = base_path / guid_folder / filename
+
+        # Check if file exists
+        if not file_path.exists():
+            raise HTTPException(
+                status_code=500,
+                detail=f"Exported file not found at {file_path}. Ensure API runs on Qlik server."
+            )
+
+        # Read file directly from filesystem
+        with open(file_path, 'rb') as f:
+            file_content = f.read()
+
+        # Generate filename for download
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        download_filename = f"factory_data_{timestamp}.xlsx"
+
+        # Return the file as streaming response
+        return StreamingResponse(
+            BytesIO(file_content),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={download_filename}"}
+        )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 503 and attempt < max_retries - 1:
+                        # File not ready yet, wait and retry
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        continue
+                    else:
+                        # Max retries reached or different error
+                        raise
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Export failed: {str(e)}"
+        )
+    finally:
+        # Close connection
+        try:
+            client.close()
+        except:
+            pass
 
 
 @router.get("/apps/{app_name}/tables/application_status/data")
