@@ -341,6 +341,7 @@ async def export_factory_data_to_excel(
 @router.get("/apps/{app_name}/tables/factory_data/export_native")
 async def export_factory_data_native(
     app_name: str = Path(..., description="Application name"),
+    file_type: str = Query("excel", description="Export format: excel, csv, or tsv"),
     factory: Optional[str] = Query(None, description="Filter by factory (Завод field), supports multiple values separated by comma"),
     warehouse: Optional[str] = Query(None, description="Filter by warehouse (Склад field), supports multiple values separated by comma"),
     typeOM: Optional[str] = Query(None, description="Filter by OM type (Тип ОМ field), supports multiple values separated by comma"),
@@ -353,10 +354,29 @@ async def export_factory_data_native(
     Export factory data using Qlik's native ExportData method (MUCH FASTER).
 
     This endpoint uses Qlik Sense's built-in ExportData API which can export
-    up to 1 million rows per sheet directly to Excel format.
+    up to 1 million rows directly to Excel, CSV, or TSV format.
+
+    **Supported formats:**
+    - excel (default): Excel .xlsx format
+    - csv: Comma-separated values
+    - tsv: Tab-separated values
 
     **This is significantly faster than the regular export endpoint for large datasets.**
     """
+    # Map file_type parameter to Qlik format codes
+    format_mapping = {
+        "excel": ("OOXML", ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "csv": ("CSV_C", ".csv", "text/csv"),
+        "tsv": ("CSV_T", ".tsv", "text/tab-separated-values")
+    }
+
+    if file_type not in format_mapping:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file_type '{file_type}'. Supported: excel, csv, tsv"
+        )
+
+    qlik_format, file_extension, media_type = format_mapping[file_type]
     table_name = "factory_data_table"  # Use the flat table object, not pivot
 
     # Check app access
@@ -418,7 +438,7 @@ async def export_factory_data_native(
         # Use native ExportData method
         export_result = client.export_data(
             object_handle=obj_handle,
-            file_type="OOXML",  # Excel format
+            file_type=qlik_format,
             path="/qHyperCubeDef",
             export_state="A"  # All values
         )
@@ -457,12 +477,12 @@ async def export_factory_data_native(
 
         # Generate filename for download
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        download_filename = f"factory_data_{timestamp}.xlsx"
+        download_filename = f"factory_data_{timestamp}{file_extension}"
 
         # Return the file as streaming response
         return StreamingResponse(
             BytesIO(file_content),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            media_type=media_type,
             headers={"Content-Disposition": f"attachment; filename={download_filename}"}
         )
 
