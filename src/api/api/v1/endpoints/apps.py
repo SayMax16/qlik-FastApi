@@ -9,7 +9,9 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from io import BytesIO
 from datetime import datetime
+import logging
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # IMPORTANT: More specific routes must come BEFORE generic routes
@@ -354,13 +356,16 @@ async def export_factory_data_native(
     Export factory data using Qlik's native ExportData method (MUCH FASTER).
 
     This endpoint uses Qlik Sense's built-in ExportData API which can export
-    up to 1 million rows directly to Excel, CSV, or TSV format.
+    up to 1 million rows directly to Excel, CSV, TSV, or Parquet format.
 
     **Supported formats:**
     - excel (default): Excel .xlsx format
     - csv: Comma-separated values
     - tsv: Tab-separated values
-    - parquet: Apache Parquet format
+    - parquet: Apache Parquet format (requires Qlik Sense November 2024+ and app-level PARQUET support)
+
+    **Note:** If PARQUET format is not supported by your Qlik version/app, it will automatically
+    fall back to Excel format.
 
     **This is significantly faster than the regular export endpoint for large datasets.**
     """
@@ -427,23 +432,69 @@ async def export_factory_data_native(
         if bookmark_id:
             client.send_request('ApplyBookmark', [bookmark_id], handle=app_handle)
 
-        # Apply selections for filtering
+        # Apply variables if specified (must be done before getting object)
+        if MeasureType:
+            client.set_variable_value(app_handle, 'vChooseType', MeasureType)
+
+        if Currency:
+            client.set_variable_value(app_handle, 'vChooseCur', Currency)
+
+        # Apply field selections for filtering
         if factory:
             factory_values = [f.strip() for f in factory.split(',')]
-            for value in factory_values:
-                client.send_request('SelectValues', ['/qHyperCubeDef', [{"qText": value}], False], handle=app_handle)
+            client.select_in_field(app_handle, 'Завод', factory_values, toggle=False)
 
-        # Get object handle
+        if warehouse:
+            warehouse_values = [w.strip() for w in warehouse.split(',')]
+            client.select_in_field(app_handle, 'Склад', warehouse_values, toggle=False)
+
+        if typeOM:
+            typeOM_values = [t.strip() for t in typeOM.split(',')]
+            client.select_in_field(app_handle, 'Тип ОМ', typeOM_values, toggle=False)
+
+        if yearMonth:
+            yearMonth_values = [ym.strip().replace('.', '-') for ym in yearMonth.split(',')]
+            client.select_in_field(app_handle, 'YearMonth', yearMonth_values, toggle=False)
+
+        # Get object handle (after selections are applied)
         obj_result = client.send_request('GetObject', [object_id], handle=app_handle)
         obj_handle = obj_result['qReturn']['qHandle']
 
-        # Use native ExportData method
-        export_result = client.export_data(
-            object_handle=obj_handle,
-            file_type=qlik_format,
-            path="/qHyperCubeDef",
-            export_state="A"  # All values
-        )
+        # Use native ExportData method with fallback for unsupported formats
+        export_result = None
+        actual_format = qlik_format
+        actual_extension = file_extension
+        actual_media_type = media_type
+
+        try:
+            export_result = client.export_data(
+                object_handle=obj_handle,
+                file_type=qlik_format,
+                path="/qHyperCubeDef",
+                export_state="A"  # All values
+            )
+        except Exception as export_error:
+            # Check if error is "Unsupported file format" (code 3004) for PARQUET
+            if qlik_format == "PARQUET" and "3004" in str(export_error):
+                logger.warning(
+                    f"PARQUET format not supported (error 3004). "
+                    f"Falling back to Excel format. "
+                    f"To enable PARQUET: Add 'SET EnableParquetSupport=1;' to app load script."
+                )
+                # Fallback to Excel
+                actual_format = "OOXML"
+                actual_extension = ".xlsx"
+                actual_media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+                export_result = client.export_data(
+                    object_handle=obj_handle,
+                    file_type=actual_format,
+                    path="/qHyperCubeDef",
+                    export_state="A"
+                )
+            else:
+                # Re-raise if it's a different error
+                raise
 
         # Get the temporary URL
         temp_url = export_result.get('qUrl')
@@ -479,12 +530,12 @@ async def export_factory_data_native(
 
         # Generate filename for download
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        download_filename = f"factory_data_{timestamp}{file_extension}"
+        download_filename = f"factory_data_{timestamp}{actual_extension}"
 
         # Return the file as streaming response
         return StreamingResponse(
             BytesIO(file_content),
-            media_type=media_type,
+            media_type=actual_media_type,
             headers={"Content-Disposition": f"attachment; filename={download_filename}"}
         )
 
