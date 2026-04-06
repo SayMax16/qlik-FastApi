@@ -528,10 +528,16 @@ class QlikEngineClient(BaseClient):
                 logger.warning(f"Could not get handle for field '{field_name}'")
                 return False
 
-            # Select values in the field
-            # Format: [{"qText": "value1"}, {"qText": "value2"}]
-            q_values = [{"qText": str(v)} for v in values]
-            select_result = self.send_request("Select", [q_values, toggle, False], handle=field_handle)
+            # SelectValues method expects array of field value objects
+            # Format: [{"qText": "value1", "qIsNumeric": false}, ...]
+            q_field_values = [{"qText": str(v), "qIsNumeric": False} for v in values]
+
+            # SelectValues parameters: [qFieldValues, qToggleMode, qSoftLock]
+            select_result = self.send_request(
+                "SelectValues",
+                [q_field_values, toggle, False],
+                handle=field_handle
+            )
 
             return select_result.get("qReturn", False)
         except Exception as e:
