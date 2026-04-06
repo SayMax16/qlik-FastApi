@@ -519,9 +519,24 @@ class QlikEngineClient(BaseClient):
         Returns:
             True if successful, False otherwise
         """
-        params = {"qFieldName": field_name, "qValues": values, "qToggleMode": toggle}
-        result = self.send_request("SelectInField", params, handle=app_handle)
-        return result.get("qReturn", False)
+        try:
+            # Get field handle
+            field_result = self.send_request("GetField", [field_name], handle=app_handle)
+            field_handle = field_result.get("qReturn", {}).get("qHandle")
+
+            if not field_handle:
+                logger.warning(f"Could not get handle for field '{field_name}'")
+                return False
+
+            # Select values in the field
+            # Format: [{"qText": "value1"}, {"qText": "value2"}]
+            q_values = [{"qText": str(v)} for v in values]
+            select_result = self.send_request("Select", [q_values, toggle, False], handle=field_handle)
+
+            return select_result.get("qReturn", False)
+        except Exception as e:
+            logger.error(f"Error selecting in field '{field_name}': {str(e)}")
+            return False
 
     def clear_selections(self, app_handle: int, locked_also: bool = False) -> bool:
         """
