@@ -928,6 +928,34 @@ async def export_factory_material_remainder_native(
         obj_result = client.send_request('GetObject', [object_id], handle=app_handle)
         obj_handle = obj_result['qReturn']['qHandle']
 
+        # Reorder dimensions so 'Дата' is the last dimension.
+        # Master measures use GetObjectDimension(Dimensionality()-1) = 'Дата',
+        # which requires 'Дата' to be the last dimension to return values.
+        try:
+            props_result = client.send_request('GetProperties', [], handle=obj_handle)
+            props = props_result.get('qProp', {})
+            cube_def = props.get('qHyperCubeDef', {})
+            dimensions = list(cube_def.get('qDimensions', []))
+
+            date_dim_idx = None
+            for i, dim in enumerate(dimensions):
+                field_defs = dim.get('qDef', {}).get('qFieldDefs', [])
+                if any('Дата' in fd for fd in field_defs):
+                    date_dim_idx = i
+                    break
+
+            if date_dim_idx is not None and date_dim_idx != len(dimensions) - 1:
+                date_dim = dimensions.pop(date_dim_idx)
+                dimensions.append(date_dim)
+                cube_def['qDimensions'] = dimensions
+                props['qHyperCubeDef'] = cube_def
+                session_result = client.send_request('CreateSessionObject', [props], handle=app_handle)
+                if 'qReturn' in session_result and 'qHandle' in session_result['qReturn']:
+                    obj_handle = session_result['qReturn']['qHandle']
+                    logger.info("Using session object with 'Дата' as last dimension for export")
+        except Exception as reorder_error:
+            logger.warning(f"Could not reorder dimensions for export: {reorder_error}, using original object")
+
         # Use native ExportData method with fallback for unsupported formats
         export_result = None
         actual_format = qlik_format
